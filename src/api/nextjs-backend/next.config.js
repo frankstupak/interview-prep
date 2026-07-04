@@ -23,27 +23,17 @@ const nextConfig = {
     ];
   },
 
-  // Headers for security and CORS
+  // Static security headers.
+  //
+  // CORS is intentionally NOT set here. A static header block cannot vary
+  // `Access-Control-Allow-Origin` per request, and emitting the raw
+  // comma-separated ALLOWED_ORIGINS value produces an invalid ACAO header that
+  // browsers reject. Origin-reflection CORS lives in src/middleware.ts instead.
   async headers() {
     return [
       {
         source: "/api/:path*",
         headers: [
-          {
-            key: "Access-Control-Allow-Origin",
-            value:
-              process.env.NODE_ENV === "production"
-                ? process.env.ALLOWED_ORIGINS || "https://yourdomain.com"
-                : "*",
-          },
-          {
-            key: "Access-Control-Allow-Methods",
-            value: "GET, POST, PUT, DELETE, PATCH, OPTIONS",
-          },
-          {
-            key: "Access-Control-Allow-Headers",
-            value: "Content-Type, Authorization, X-Requested-With",
-          },
           {
             key: "X-Content-Type-Options",
             value: "nosniff",
@@ -53,20 +43,24 @@ const nextConfig = {
             value: "DENY",
           },
           {
+            // OWASP guidance: the legacy XSS auditor can introduce
+            // vulnerabilities; disable it and rely on CSP instead.
             key: "X-XSS-Protection",
-            value: "1; mode=block",
+            value: "0",
+          },
+          {
+            key: "Referrer-Policy",
+            value: "no-referrer",
           },
         ],
       },
     ];
   },
 
-  // Environment variables validation
-  // Remove NODE_ENV as Next.js handles it automatically
-  env: {
-    DATABASE_URL: process.env.DATABASE_URL,
-    JWT_SECRET: process.env.JWT_SECRET,
-  },
+  // NOTE: DATABASE_URL and JWT_SECRET are deliberately NOT exposed via the
+  // `env` key. Values placed there are inlined into the JavaScript bundle at
+  // build time (including client bundles) — a secret-leak. Server code reads
+  // them directly from process.env in route handlers / server components.
 
   // Logging configuration
   logging: {
