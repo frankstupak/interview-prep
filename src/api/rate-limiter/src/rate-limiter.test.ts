@@ -5,8 +5,8 @@ import {
   checkRateLimitWithTokenBucket,
   LimitResult,
   RateLimitType,
-  RateLimitRedisClient,
 } from "./rateLimited-redis";
+import { TestRedisClient } from "./test-redis-client";
 import {
   checkRateLimitWithSlidingWindowMemory,
   checkRateLimitWithFixedWindowMemory,
@@ -35,145 +35,12 @@ afterEach(async () => {
   clearMemoryStorage();
 });
 
-// Mock Redis client that supports the methods we need for testing
-class MockRedisClient implements RateLimitRedisClient {
-  private data: Map<string, Array<{ score: number; member: string }>> = new Map();
-  private fixedWindowCounters: Map<string, { count: number; windowStart: number }> = new Map();
-  private tokenBuckets: Map<string, { tokens: number; lastRefill: number }> = new Map();
-
-  async eval(
-    script: string,
-    numkeys: number,
-    ...args: string[]
-  ): Promise<[number, number, number]> {
-    const keys = args.slice(0, numkeys);
-    const arguments_ = args.slice(numkeys);
-    const [key] = keys;
-
-    // Determine algorithm type based on the key
-    if (key.includes(":fixed")) {
-      const [now, windowMs, limit] = arguments_.map(Number);
-      return this.handleFixedWindow(key, now, windowMs, limit);
-    } else if (key.includes(":token-bucket")) {
-      const [now, refillMs, capacity] = arguments_.map(Number);
-      return this.handleTokenBucket(key, now, refillMs, capacity);
-    } else {
-      const [now, windowMs, limit] = arguments_.map(Number);
-      return this.handleSlidingWindow(key, now, windowMs, limit);
-    }
-  }
-
-  private handleSlidingWindow(
-    key: string,
-    now: number,
-    windowMs: number,
-    limit: number
-  ): [number, number, number] {
-    // Get the start time
-    // Why: This allows the server to get the start time.
-    const start = now - windowMs;
-
-    // Get or create sorted set for this key
-    // Why: This allows the server to get or create the sorted set for this key.
-    let sortedSet = this.data.get(key) || [];
-
-    // Remove old entries (ZREMRANGEBYSCORE equivalent)
-    // Why: This allows the server to remove the old entries.
-    sortedSet = sortedSet.filter((item) => item.score > start);
-
-    // Add current request (ZADD equivalent)
-    // Why: This allows the server to add the current request.
-    sortedSet.push({ score: now, member: now.toString() });
-
-    // Update the data
-    // Why: This allows the server to update the data.
-    this.data.set(key, sortedSet);
-
-    const count = sortedSet.length;
-    // Get the oldest time
-    // Why: This allows the server to get the oldest time.
-    const oldest = sortedSet.length > 0 ? sortedSet[0].score : now;
-    // Get the reset time
-    // Why: This allows the server to get the reset time.
-    const resetMs = Math.max(0, oldest + windowMs - now);
-
-    const allowed = count <= limit ? 1 : 0;
-    // Get the remaining count
-    // Why: This allows the server to get the remaining count.
-    const remaining = Math.max(0, limit - count);
-
-    // Return the allowed, remaining, and reset time
-    // Why: This allows the server to return the allowed, remaining, and reset time.
-    return [allowed, remaining, resetMs];
-  }
-
-  private handleFixedWindow(
-    key: string,
-    now: number,
-    windowMs: number,
-    limit: number
-  ): [number, number, number] {
-    // Calculate which time bucket this request falls into
-    const windowStart = Math.floor(now / windowMs) * windowMs;
-    const windowEnd = windowStart + windowMs;
-
-    // Get or create counter for this window
-    let counter = this.fixedWindowCounters.get(key);
-
-    // If no counter exists or we're in a new window, reset the counter
-    if (!counter || counter.windowStart !== windowStart) {
-      counter = { count: 0, windowStart };
-      this.fixedWindowCounters.set(key, counter);
-    }
-
-    // Increment the counter for this request
-    counter.count++;
-
-    const allowed = counter.count <= limit ? 1 : 0;
-    const remaining = Math.max(0, limit - counter.count);
-    const resetMs = windowEnd - now;
-
-    return [allowed, remaining, resetMs];
-  }
-
-  private handleTokenBucket(
-    key: string,
-    now: number,
-    refillMs: number,
-    capacity: number
-  ): [number, number, number] {
-    // Get or create bucket for this key
-    let bucket = this.tokenBuckets.get(key);
-
-    if (!bucket) {
-      bucket = { tokens: capacity, lastRefill: now };
-      this.tokenBuckets.set(key, bucket);
-    }
-
-    // Calculate tokens to add based on time elapsed
-    const timePassed = now - bucket.lastRefill;
-    const tokensToAdd = Math.floor(timePassed / refillMs);
-
-    // Refill tokens (capped at capacity)
-    bucket.tokens = Math.min(capacity, bucket.tokens + tokensToAdd);
-    bucket.lastRefill = bucket.lastRefill + tokensToAdd * refillMs;
-
-    // Try to consume one token
-    let allowed = 0;
-    let remaining = bucket.tokens;
-
-    if (bucket.tokens > 0) {
-      allowed = 1;
-      bucket.tokens--;
-      remaining = bucket.tokens;
-    }
-
-    // Calculate time until next token is available
-    const resetMs = bucket.tokens === 0 ? refillMs : 0;
-
-    return [allowed, remaining, resetMs];
-  }
-}
+// Redis test client: executes the REAL Lua scripts via ioredis-mock (fengari)
+// instead of re-implementing the algorithms in JS. The old hand-written mock
+// never ran the Lua and diverged from real Redis semantics (it pushed duplicate
+// sorted-set members where real ZADD dedupes), which is exactly how the
+// same-millisecond undercount bug stayed invisible. See test-redis-client.ts.
+class MockRedisClient extends TestRedisClient {}
 describe("sliding window", () => {
   it("sliding-window: should return the correct limit", async () => {
     const redis = new MockRedisClient();
@@ -365,7 +232,13 @@ describe("fixed window", () => {
     const limit = 1_000;
     const windowMs = 60_000;
     const totalRequests = limit * 2;
-    const baseTime = Date.now();
+    // Pin baseTime to a window boundary. The old `Date.now()` baseTime made
+    // this test genuinely flaky: whenever the wall clock landed within
+    // `totalRequests` ms of a window boundary (~3% of runs), the window rolled
+    // over mid-loop, the counter reset, and the assertions failed. The
+    // "relax remaining assertion for CI flakiness" commit treated the symptom;
+    // aligning the timeline is the fix — and the strict assertion comes back.
+    const baseTime = Math.floor(Date.now() / windowMs) * windowMs;
 
     let allowedCount = 0;
     let rejectedCount = 0;
@@ -381,9 +254,8 @@ describe("fixed window", () => {
 
       if (result.allowed) {
         allowedCount += 1;
-        // Remaining in valid range (relaxed for CI/mock Redis timing)
-        expect(result.remaining).toBeGreaterThanOrEqual(0);
-        expect(result.remaining).toBeLessThanOrEqual(limit);
+        // Strict again: deterministic timeline, deterministic remaining.
+        expect(result.remaining).toBe(limit - allowedCount);
       } else {
         rejectedCount += 1;
         expect(result.remaining).toBe(0);

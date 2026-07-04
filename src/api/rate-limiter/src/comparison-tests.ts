@@ -5,123 +5,20 @@ import {
   checkRateLimitWithFixedWindow,
   checkRateLimitWithTokenBucket,
   RateLimitType,
-  RateLimitRedisClient,
 } from "./rateLimited-redis";
 import {
   checkRateLimitWithSlidingWindowMemory,
   checkRateLimitWithFixedWindowMemory,
   checkRateLimitWithTokenBucketMemory,
 } from "./rateLimited-implemented";
+import { TestRedisClient } from "./test-redis-client";
 
-// Mock Redis client for testing
-class MockRedisClient implements RateLimitRedisClient {
-  private data: Map<string, Array<{ score: number; member: string }>> = new Map();
-  private fixedWindowCounters: Map<string, { count: number; windowStart: number }> = new Map();
-  private tokenBuckets: Map<string, { tokens: number; lastRefill: number }> = new Map();
+// Redis test client: executes the REAL Lua scripts via ioredis-mock (fengari).
+// The old hand-written mock re-implemented the algorithms in JS and never ran
+// the Lua, so these "equivalence" tests were comparing two JS re-implementations
+// against each other. Now they compare the shipped Lua against the memory path.
 
-  async scriptLoad(_script: string): Promise<string> {
-    return "mock-sha";
-  }
-
-  async eval(
-    _script: string,
-    numkeys: number,
-    ...args: string[]
-  ): Promise<[number, number, number]> {
-    const keys = args.slice(0, numkeys);
-    const arguments_ = args.slice(numkeys);
-    const [key] = keys;
-
-    // Determine algorithm type based on the key
-    if (key.includes(":fixed")) {
-      const [now, windowMs, limit] = arguments_.map(Number);
-      return this.handleFixedWindow(key, now, windowMs, limit);
-    } else if (key.includes(":token-bucket")) {
-      const [now, refillMs, capacity] = arguments_.map(Number);
-      return this.handleTokenBucket(key, now, refillMs, capacity);
-    } else {
-      const [now, windowMs, limit] = arguments_.map(Number);
-      return this.handleSlidingWindow(key, now, windowMs, limit);
-    }
-  }
-
-  private handleSlidingWindow(
-    key: string,
-    now: number,
-    windowMs: number,
-    limit: number
-  ): [number, number, number] {
-    const start = now - windowMs;
-    let sortedSet = this.data.get(key) || [];
-    sortedSet = sortedSet.filter((item) => item.score > start);
-    sortedSet.push({ score: now, member: now.toString() });
-    this.data.set(key, sortedSet);
-
-    const count = sortedSet.length;
-    const oldest = sortedSet.length > 0 ? sortedSet[0].score : now;
-    const resetMs = Math.max(0, oldest + windowMs - now);
-    const allowed = count <= limit ? 1 : 0;
-    const remaining = Math.max(0, limit - count);
-
-    return [allowed, remaining, resetMs];
-  }
-
-  private handleFixedWindow(
-    key: string,
-    now: number,
-    windowMs: number,
-    limit: number
-  ): [number, number, number] {
-    const windowStart = Math.floor(now / windowMs) * windowMs;
-    const windowEnd = windowStart + windowMs;
-    let counter = this.fixedWindowCounters.get(key);
-
-    if (!counter || counter.windowStart !== windowStart) {
-      counter = { count: 0, windowStart };
-    }
-
-    counter.count++;
-    this.fixedWindowCounters.set(key, counter);
-
-    const allowed = counter.count <= limit ? 1 : 0;
-    const remaining = Math.max(0, limit - counter.count);
-    const resetMs = windowEnd - now;
-
-    return [allowed, remaining, resetMs];
-  }
-
-  private handleTokenBucket(
-    key: string,
-    now: number,
-    refillMs: number,
-    capacity: number
-  ): [number, number, number] {
-    let bucket = this.tokenBuckets.get(key);
-
-    if (!bucket) {
-      bucket = { tokens: capacity, lastRefill: now };
-    }
-
-    const timePassed = now - bucket.lastRefill;
-    const tokensToAdd = Math.floor(timePassed / refillMs);
-    bucket.tokens = Math.min(capacity, bucket.tokens + tokensToAdd);
-    bucket.lastRefill = bucket.lastRefill + tokensToAdd * refillMs;
-
-    let allowed = 0;
-    let remaining = bucket.tokens;
-
-    if (bucket.tokens > 0) {
-      allowed = 1;
-      bucket.tokens--;
-      remaining = bucket.tokens;
-    }
-
-    this.tokenBuckets.set(key, bucket);
-    const resetMs = bucket.tokens === 0 ? refillMs : 0;
-
-    return [allowed, remaining, resetMs];
-  }
-}
+class MockRedisClient extends TestRedisClient {}
 
 // Comparison Tests: Redis vs In-Memory Implementations
 describe("🔄 Redis vs In-Memory Comparison Tests", () => {
