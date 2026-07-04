@@ -159,40 +159,53 @@ export class StringMatcher {
     const m = str1.length;
     const n = str2.length;
 
-    // Create a matrix to store distances
-    const dp: number[][] = Array(m + 1)
-      .fill(null)
-      .map(() => Array(n + 1).fill(0));
+    // Fast paths avoid allocation entirely for trivial inputs.
+    if (m === 0) return n * config.insertCost;
+    if (n === 0) return m * config.deleteCost;
 
-    // Initialize base cases
-    for (let i = 0; i <= m; i++) {
-      dp[i][0] = i * config.deleteCost;
-    }
-    for (let j = 0; j <= n; j++) {
-      dp[0][j] = j * config.insertCost;
-    }
+    // Damerau transposition needs the row two above the current one, so we keep
+    // a rolling THREE-row buffer instead of the full (m+1)x(n+1) matrix.
+    // Space drops from O(m*n) to O(3n); results are identical.
+    const { insertCost, deleteCost, substituteCost, transpositionCost } = config;
 
-    // Fill the matrix
+    let prevPrev = new Array<number>(n + 1); // row i-2
+    let prev = new Array<number>(n + 1); // row i-1
+    let curr = new Array<number>(n + 1); // row i
+
+    for (let j = 0; j <= n; j++) prev[j] = j * insertCost;
+
     for (let i = 1; i <= m; i++) {
-      for (let j = 1; j <= n; j++) {
-        if (str1[i - 1] === str2[j - 1]) {
-          dp[i][j] = dp[i - 1][j - 1]; // No cost for exact match
-        } else {
-          dp[i][j] = Math.min(
-            dp[i - 1][j] + config.deleteCost, // Deletion
-            dp[i][j - 1] + config.insertCost, // Insertion
-            dp[i - 1][j - 1] + config.substituteCost // Substitution
-          );
+      curr[0] = i * deleteCost;
+      const c1 = str1[i - 1];
 
-          // Damerau-Levenshtein: consider transposition
-          if (i > 1 && j > 1 && str1[i - 1] === str2[j - 2] && str1[i - 2] === str2[j - 1]) {
-            dp[i][j] = Math.min(dp[i][j], dp[i - 2][j - 2] + config.transpositionCost);
+      for (let j = 1; j <= n; j++) {
+        if (c1 === str2[j - 1]) {
+          curr[j] = prev[j - 1];
+        } else {
+          let best =
+            prev[j] + deleteCost < prev[j - 1] + substituteCost
+              ? prev[j] + deleteCost
+              : prev[j - 1] + substituteCost;
+          const ins = curr[j - 1] + insertCost;
+          if (ins < best) best = ins;
+
+          // Damerau-Levenshtein: adjacent transposition (row i-2 needed here).
+          if (i > 1 && j > 1 && c1 === str2[j - 2] && str1[i - 2] === str2[j - 1]) {
+            const trans = prevPrev[j - 2] + transpositionCost;
+            if (trans < best) best = trans;
           }
+          curr[j] = best;
         }
       }
+
+      // Rotate the three rows, reusing the oldest buffer to avoid allocation.
+      const recycled = prevPrev;
+      prevPrev = prev;
+      prev = curr;
+      curr = recycled;
     }
 
-    return dp[m][n];
+    return prev[n];
   }
 
   /**

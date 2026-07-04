@@ -11,6 +11,7 @@ import { StringMatcher } from "./algorithms/string-matching";
 import { PhoneticMatcher } from "./algorithms/phonetic-matching";
 import { NGramMatcher } from "./algorithms/ngram-matching";
 import { RankingAlgorithms } from "./algorithms/ranking-algorithms";
+import { InvertedIndex } from "./algorithms/inverted-index";
 import {
   SearchableItem,
   SearchRequest,
@@ -26,6 +27,10 @@ import { SearchEngineLimit, SearchAlgorithmName } from "./constants";
 
 export class SearchEngine {
   private items: SearchableItem[] = [];
+  // Lazily-built inverted index for BM25/TF-IDF/semantic ranking. Invalidated
+  // whenever the corpus changes and rebuilt on first ranking query so repeated
+  // queries against a stable corpus don't re-scan every document each time.
+  private rankingIndex: InvertedIndex | null = null;
   private analytics: SearchAnalytics[] = [];
   private maxAnalyticsSize: number = SearchEngineLimit.MAX_ANALYTICS_SIZE; // Configurable limit for analytics buffer
   private metrics: SearchMetrics = {
@@ -37,7 +42,10 @@ export class SearchEngine {
     cacheHitRate: 0,
   };
 
-  constructor(items: SearchableItem[] = [], maxAnalyticsSize: number = SearchEngineLimit.MAX_ANALYTICS_SIZE) {
+  constructor(
+    items: SearchableItem[] = [],
+    maxAnalyticsSize: number = SearchEngineLimit.MAX_ANALYTICS_SIZE
+  ) {
     this.items = [...items];
     this.maxAnalyticsSize = maxAnalyticsSize;
     this.updateMetrics();
@@ -48,6 +56,7 @@ export class SearchEngine {
    */
   addItems(newItems: SearchableItem[]): void {
     this.items.push(...newItems);
+    this.rankingIndex = null; // corpus changed — drop the cached inverted index
     this.updateMetrics();
     console.warn(`📚 Added ${newItems.length} items to search index`);
   }
@@ -62,6 +71,7 @@ export class SearchEngine {
         this.items[index] = updatedItem;
       }
     }
+    this.rankingIndex = null; // corpus changed — drop the cached inverted index
     this.updateMetrics();
     console.warn(`🔄 Updated ${updatedItems.length} items in search index`);
   }
@@ -71,8 +81,22 @@ export class SearchEngine {
    */
   removeItems(itemIds: string[]): void {
     this.items = this.items.filter((item) => !itemIds.includes(item.id));
+    this.rankingIndex = null; // corpus changed — drop the cached inverted index
     this.updateMetrics();
     console.warn(`🗑️ Removed ${itemIds.length} items from search index`);
+  }
+
+  /**
+   * Return the inverted index for the current corpus, building it on first use
+   * and reusing it until the corpus changes. This is what makes repeated BM25 /
+   * TF-IDF queries fast: the O(N * L) tokenize-and-count pass runs once, not
+   * per query.
+   */
+  private getRankingIndex(): InvertedIndex {
+    if (!this.rankingIndex) {
+      this.rankingIndex = new InvertedIndex(this.items);
+    }
+    return this.rankingIndex;
   }
 
   /**
@@ -355,10 +379,12 @@ export class SearchEngine {
         const fieldValue = this.getFieldValue(item, field);
         if (!fieldValue) continue;
 
-        // For fuzzy search, we'll check similarity with the entire field and individual words
-        const words = fieldValue.split(/\s+/);
+        // For fuzzy search, compare the query against each field word.
+        // tokenizeWithOffsets strips punctuation and gives the exact position of
+        // every word, so repeated words highlight correctly.
+        const words = this.tokenizeWithOffsets(fieldValue);
 
-        for (const word of words) {
+        for (const { word, start } of words) {
           // Optimize: skip words with drastically different lengths
           const lengthDiff = Math.abs(word.length - query.length);
           const maxLengthDiff = Math.ceil(query.length * (1 - threshold));
@@ -367,13 +393,11 @@ export class SearchEngine {
           const similarity = StringMatcher.calculateSimilarity(word, query, "levenshtein");
 
           if (similarity >= threshold) {
-            // Cache indexOf result to avoid duplicate calls
-            const startIndex = fieldValue.indexOf(word);
             allMatches.push({
               field,
               value: word,
-              startIndex,
-              endIndex: startIndex + word.length - 1,
+              startIndex: start,
+              endIndex: start + word.length - 1,
               matchType: "fuzzy",
             });
             bestScore = Math.max(bestScore, similarity);
@@ -414,17 +438,17 @@ export class SearchEngine {
         const fieldValue = this.getFieldValue(item, field);
         if (!fieldValue) continue;
 
-        const words = fieldValue.split(/\s+/);
+        const words = this.tokenizeWithOffsets(fieldValue);
 
-        for (const word of words) {
+        for (const { word, start } of words) {
           const similarity = PhoneticMatcher.phoneticSimilarity(word, query, "metaphone");
 
           if (similarity >= threshold) {
             allMatches.push({
               field,
               value: word,
-              startIndex: fieldValue.indexOf(word),
-              endIndex: fieldValue.indexOf(word) + word.length - 1,
+              startIndex: start,
+              endIndex: start + word.length - 1,
               matchType: "phonetic",
             });
             bestScore = Math.max(bestScore, similarity);
@@ -517,9 +541,9 @@ export class SearchEngine {
         const fieldValue = this.getFieldValue(item, field);
         if (!fieldValue) continue;
 
-        const words = fieldValue.split(/\s+/);
+        const words = this.tokenizeWithOffsets(fieldValue);
 
-        for (const word of words) {
+        for (const { word, start } of words) {
           const searchWord = options.caseSensitive ? word : word.toLowerCase();
           const searchQuery = options.caseSensitive ? query : query.toLowerCase();
 
@@ -527,8 +551,8 @@ export class SearchEngine {
             allMatches.push({
               field,
               value: word,
-              startIndex: fieldValue.indexOf(word),
-              endIndex: fieldValue.indexOf(word) + word.length - 1,
+              startIndex: start,
+              endIndex: start + word.length - 1,
               matchType: "exact",
             });
             totalScore++;
@@ -569,22 +593,57 @@ export class SearchEngine {
         const fieldValue = this.getFieldValue(item, field);
         if (!fieldValue) continue;
 
-        const similarity = NGramMatcher.jaccardSimilarity(
+        // Whole-field Jaccard collapses toward zero when the query is much
+        // shorter than a multi-word field (their padded bigram sets barely
+        // overlap in proportion to their union), so a one-word query rarely
+        // clears the threshold against a real document. Compare the query
+        // against each field WORD as well and keep the best match, so ngram
+        // search actually finds short queries inside long fields. The
+        // whole-field score is retained as a floor for cross-word similarity.
+        const wholeFieldSim = NGramMatcher.jaccardSimilarity(
           fieldValue,
           query,
           2,
           !options.caseSensitive
         );
 
-        if (similarity >= threshold) {
-          allMatches.push({
-            field,
-            value: fieldValue,
-            startIndex: 0,
-            endIndex: fieldValue.length - 1,
-            matchType: "fuzzy",
-          });
-          bestScore = Math.max(bestScore, similarity);
+        let fieldBest = wholeFieldSim;
+        let bestWord: { word: string; start: number } | null = null;
+
+        for (const token of this.tokenizeWithOffsets(fieldValue)) {
+          const wordSim = NGramMatcher.jaccardSimilarity(
+            token.word,
+            query,
+            2,
+            !options.caseSensitive
+          );
+          if (wordSim > fieldBest) {
+            fieldBest = wordSim;
+            bestWord = token;
+          }
+        }
+
+        if (fieldBest >= threshold) {
+          // Highlight the best-matching word when one beat the whole-field
+          // score; otherwise fall back to marking the whole field.
+          if (bestWord) {
+            allMatches.push({
+              field,
+              value: bestWord.word,
+              startIndex: bestWord.start,
+              endIndex: bestWord.start + bestWord.word.length - 1,
+              matchType: "fuzzy",
+            });
+          } else {
+            allMatches.push({
+              field,
+              value: fieldValue,
+              startIndex: 0,
+              endIndex: fieldValue.length - 1,
+              matchType: "fuzzy",
+            });
+          }
+          bestScore = Math.max(bestScore, fieldBest);
         }
       }
 
@@ -609,7 +668,8 @@ export class SearchEngine {
    * BM25 Ranking Search
    */
   private async bm25Search(query: string, options: SearchOptions): Promise<SearchResult[]> {
-    const bm25Results = RankingAlgorithms.calculateBM25(this.items, query);
+    // Use the cached inverted index instead of re-scanning every document.
+    const bm25Results = this.getRankingIndex().bm25(query);
 
     return bm25Results.map((result) => ({
       item: result.item,
@@ -627,7 +687,8 @@ export class SearchEngine {
    * TF-IDF Search
    */
   private async tfidfSearch(query: string, options: SearchOptions): Promise<SearchResult[]> {
-    const tfidfResults = RankingAlgorithms.calculateTFIDF(this.items, query);
+    // Use the cached inverted index instead of re-scanning every document.
+    const tfidfResults = this.getRankingIndex().tfidf(query);
 
     return tfidfResults.map((result) => ({
       item: result.item,
@@ -717,6 +778,28 @@ export class SearchEngine {
   /**
    * Helper Methods
    */
+
+  /**
+   * Split a field into words while recording each word's true start offset.
+   *
+   * The frozen implementation used `fieldValue.split(/\s+/)` and then
+   * `fieldValue.indexOf(word)` to recover positions. That has two bugs:
+   *   1. Punctuation stays glued to words ("TypeScript," never equals the query
+   *      "TypeScript"), hurting fuzzy/phonetic/wildcard recall.
+   *   2. `indexOf` from the start returns the FIRST occurrence, so every repeat
+   *      of a word reports the same (wrong) offset — corrupting highlighting.
+   * Tracking offsets during a single regex scan fixes both.
+   */
+  private tokenizeWithOffsets(text: string): Array<{ word: string; start: number }> {
+    const tokens: Array<{ word: string; start: number }> = [];
+    // Unicode-aware word matcher: letters/numbers/underscore/apostrophes.
+    const re = /[\p{L}\p{N}_']+/gu;
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(text)) !== null) {
+      tokens.push({ word: match[0], start: match.index });
+    }
+    return tokens;
+  }
 
   private getFieldValue(item: SearchableItem, field: string): string {
     switch (field) {
@@ -927,7 +1010,10 @@ export class SearchEngine {
 
     // Keep only top 20 popular queries
     this.metrics.popularQueries.sort((a, b) => b.count - a.count);
-    this.metrics.popularQueries = this.metrics.popularQueries.slice(0, SearchEngineLimit.POPULAR_QUERIES_TOP);
+    this.metrics.popularQueries = this.metrics.popularQueries.slice(
+      0,
+      SearchEngineLimit.POPULAR_QUERIES_TOP
+    );
   }
 
   private updateMetrics(): void {
