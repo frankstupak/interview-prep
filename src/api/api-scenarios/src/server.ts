@@ -21,7 +21,6 @@ import multipart from "@fastify/multipart";
 import websocket from "@fastify/websocket";
 import swagger from "@fastify/swagger";
 import swaggerUi from "@fastify/swagger-ui";
-import { z } from "zod";
 
 // Middleware
 import {
@@ -47,7 +46,6 @@ import { UserController } from "./controllers/user-controller";
 import { User } from "./types/entities";
 import {
   HttpStatus,
-  CrudErrorCode,
   UserRole,
   UserRoleList,
   UserStatusList,
@@ -103,11 +101,6 @@ const HttpMethods: ReadonlyArray<HttpMethod> = [
 
 const isHttpMethod = (value: string): value is HttpMethod =>
   HttpMethods.some((method) => method === value);
-
-const bulkUserOperationSchema = z.object({
-  operation: z.enum(["create", "update", "delete"]),
-  data: z.array(z.unknown()),
-});
 
 function registerRoute(
   server: FastifyInstance,
@@ -727,33 +720,9 @@ function registerApiRoutes(): void {
       },
       preHandler: [requireAuthentication, requireRole([UserRole.ADMIN])],
     },
-    async (request, reply) => {
-      const parsed = bulkUserOperationSchema.safeParse(request.body);
-      if (!parsed.success) {
-        reply.code(HttpStatus.BAD_REQUEST).send({
-          success: false,
-          error: {
-            code: CrudErrorCode.INVALID_INPUT,
-            message: "Validation failed",
-            details: parsed.error.flatten(),
-            statusCode: HttpStatus.BAD_REQUEST,
-          },
-        });
-        return;
-      }
-
-      const { operation, data } = parsed.data;
-      reply.send({
-        success: true,
-        message: `Bulk ${operation} operation completed`,
-        processed: data.length,
-        data: {
-          operation,
-          processed: data.length,
-          note: "This is a mock implementation",
-        },
-      });
-    }
+    // Real implementation — was a mock that acknowledged the operation and
+    // persisted nothing.
+    userController.bulkOperation.bind(userController)
   );
 
   server.log.info("Routes registered successfully");
@@ -999,6 +968,10 @@ export async function createTestServer(): Promise<FastifyInstance> {
     "POST /api/v1/users/:id/avatar": {
       preHandler: [requireAuthentication],
       handler: localUserController.uploadAvatar.bind(localUserController),
+    },
+    "POST /api/v1/users/bulk": {
+      preHandler: [requireAuthentication, requireRole([UserRole.ADMIN])],
+      handler: localUserController.bulkOperation.bind(localUserController),
     },
   };
 

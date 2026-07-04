@@ -118,6 +118,24 @@ const userQuerySchema = z
   })
   .passthrough();
 
+const bulkOperationSchema = z.object({
+  operation: z.enum(["create", "update", "delete"]),
+  data: z.array(z.unknown()).min(1),
+});
+
+const bulkUpdateItemSchema = z
+  .object({
+    id: z.string().min(1),
+    version: z.number().int().positive().optional(),
+    username: z.string().min(UserValidation.USERNAME_MIN_LENGTH).optional(),
+    email: z.string().email().optional(),
+    firstName: z.string().min(UserValidation.NAME_MIN_LENGTH).optional(),
+    lastName: z.string().min(UserValidation.NAME_MIN_LENGTH).optional(),
+    role: z.enum(UserRoleList).optional(),
+    status: z.enum(UserStatusList).optional(),
+  })
+  .strict();
+
 const defaultUserPreferences: UserPreferences = {
   notifications: {
     email: USER_DEFAULTS.PREFERENCES.NOTIFICATIONS.EMAIL,
@@ -173,16 +191,16 @@ export class UserController {
         return;
       }
 
-      // Check if user already exists
-      const existingUserQuery: AdvancedQuery = {
-        filters: [
-          { field: UserField.EMAIL, operator: QueryOperator.EQ, value: body.email },
-          { field: UserField.USERNAME, operator: QueryOperator.EQ, value: body.username },
-        ],
-      };
-
-      const existingUsers = await this.userService.getMany(existingUserQuery, userId);
-      if (existingUsers.success && existingUsers.data!.data.length > 0) {
+      // Check if user already exists. Email OR username taken must conflict —
+      // a single filters array is AND semantics, so run one targeted (indexed)
+      // query per unique field.
+      const isTaken = await this.isEmailOrUsernameTaken(
+        body.email.toLowerCase(),
+        body.username,
+        undefined,
+        userId
+      );
+      if (isTaken) {
         reply.code(HttpStatus.CONFLICT).send({
           success: false,
           error: {
@@ -458,32 +476,17 @@ export class UserController {
         return;
       }
 
-      // Check if email/username is already taken (if being updated)
+      // Check if email/username is already taken (if being updated).
+      // Filters are AND semantics: email-conflict and username-conflict must
+      // be checked independently, each excluding the user being updated.
       if (body.email || body.username) {
-        const conflictQuery: AdvancedQuery = {
-          filters: [
-            { field: BaseEntityField.ID, operator: QueryOperator.NE, value: id }, // Exclude current user
-          ],
-        };
-
-        if (body.email) {
-          conflictQuery.filters!.push({
-            field: UserField.EMAIL,
-            operator: QueryOperator.EQ,
-            value: body.email.toLowerCase(),
-          });
-        }
-
-        if (body.username) {
-          conflictQuery.filters!.push({
-            field: UserField.USERNAME,
-            operator: QueryOperator.EQ,
-            value: body.username,
-          });
-        }
-
-        const conflictUsers = await this.userService.getMany(conflictQuery, userId);
-        if (conflictUsers.success && conflictUsers.data!.data.length > 0) {
+        const conflict = await this.isEmailOrUsernameTaken(
+          body.email?.toLowerCase(),
+          body.username,
+          id,
+          userId
+        );
+        if (conflict) {
           reply.code(HttpStatus.CONFLICT).send({
             success: false,
             error: {
@@ -510,20 +513,36 @@ export class UserController {
         if (body.status) updateData.status = body.status;
       }
 
-      if (body.profile) updateData.profile = body.profile;
-      if (body.preferences) {
-        updateData.preferences = {
-          ...defaultUserPreferences,
-          ...body.preferences,
-          notifications: {
-            ...defaultUserPreferences.notifications,
-            ...body.preferences.notifications,
-          },
-          privacy: {
-            ...defaultUserPreferences.privacy,
-            ...body.preferences.privacy,
-          },
-        };
+      // Partial profile/preferences updates merge against the user's CURRENT
+      // nested objects (not defaults, not wholesale replacement) — otherwise a
+      // partial update silently wipes sibling fields (e.g. sending only
+      // { notifications } used to reset a user's chosen theme back to default).
+      if (body.profile || body.preferences) {
+        const currentResult = await this.userService.getById(id, userId);
+        if (!currentResult.success) {
+          reply.code(currentResult.error!.statusCode).send(currentResult);
+          return;
+        }
+        const current = currentResult.data!;
+
+        if (body.profile) {
+          updateData.profile = { ...current.profile, ...body.profile };
+        }
+        if (body.preferences) {
+          const base = current.preferences ?? defaultUserPreferences;
+          updateData.preferences = {
+            ...base,
+            ...body.preferences,
+            notifications: {
+              ...base.notifications,
+              ...body.preferences.notifications,
+            },
+            privacy: {
+              ...base.privacy,
+              ...body.preferences.privacy,
+            },
+          };
+        }
       }
 
       const result = await this.userService.update(id, updateData, userId);
@@ -791,11 +810,20 @@ export class UserController {
 
       const avatarUrl = `/uploads/avatars/${id}-${Date.now()}.${data.mimetype.split("/")[1]}`;
 
+      // Merge into the CURRENT profile — replacing the whole profile object
+      // used to wipe timezone/language/phoneNumber on every avatar upload.
+      const currentResult = await this.userService.getById(id, userId);
+      if (!currentResult.success) {
+        reply.code(currentResult.error!.statusCode).send(currentResult);
+        return;
+      }
+
       // Update user profile with avatar URL
       const updateResult = await this.userService.update(
         id,
         {
           profile: {
+            ...currentResult.data!.profile,
             avatar: avatarUrl,
           },
         },
@@ -830,8 +858,241 @@ export class UserController {
   }
 
   /**
+   * Bulk user operations (create / update / delete)
+   * POST /users/bulk  (admin only — enforced by route preHandler)
+   *
+   * Why: The shipped endpoint replied "Bulk operation completed ... This is a
+   * mock implementation" and persisted nothing. This executes the operation.
+   * When: Use for admin imports, batch edits, and batch removal
+   */
+  async bulkOperation(request: FastifyRequest, reply: FastifyReply): Promise<void> {
+    try {
+      const parsed = bulkOperationSchema.safeParse(request.body);
+      if (!parsed.success) {
+        this.sendValidationError(reply, parsed.error);
+        return;
+      }
+      const { operation, data } = parsed.data;
+      const userId = request.requestContext?.userId;
+
+      if (operation === "create") {
+        // Validate every item up-front (schema + uniqueness incl. within batch).
+        const items: CreateEntityInput<User>[] = [];
+        const seenEmails = new Set<string>();
+        const seenUsernames = new Set<string>();
+
+        for (let i = 0; i < data.length; i++) {
+          const item = createUserSchema.safeParse(data[i]);
+          if (!item.success) {
+            reply.code(HttpStatus.BAD_REQUEST).send({
+              success: false,
+              error: {
+                code: CrudErrorCode.VALIDATION_ERROR,
+                message: `Validation failed for item ${i}`,
+                details: item.error.issues.map((issue) => issue.message),
+                statusCode: HttpStatus.BAD_REQUEST,
+              },
+            });
+            return;
+          }
+          const body = item.data;
+          const email = body.email.toLowerCase();
+          const taken =
+            seenEmails.has(email) ||
+            seenUsernames.has(body.username) ||
+            (await this.isEmailOrUsernameTaken(email, body.username, undefined, userId));
+          if (taken) {
+            reply.code(HttpStatus.CONFLICT).send({
+              success: false,
+              error: {
+                code: UserErrorCode.USER_EXISTS,
+                message: `Item ${i}: email or username already taken`,
+                statusCode: HttpStatus.CONFLICT,
+              },
+            });
+            return;
+          }
+          seenEmails.add(email);
+          seenUsernames.add(body.username);
+
+          const passwordHash = await bcrypt.hash(body.password, 12);
+          items.push({
+            username: body.username,
+            email,
+            passwordHash,
+            firstName: body.firstName,
+            lastName: body.lastName,
+            role: body.role || USER_DEFAULTS.ROLE,
+            status: USER_DEFAULTS.STATUS,
+            twoFactorEnabled: USER_DEFAULTS.TWO_FACTOR_ENABLED,
+            profile: {
+              timezone: USER_DEFAULTS.PROFILE.TIMEZONE,
+              language: USER_DEFAULTS.PROFILE.LANGUAGE,
+            },
+            preferences: { ...defaultUserPreferences },
+          });
+        }
+
+        const result = await this.userService.bulkCreate(items, userId);
+        if (!result.success) {
+          reply.code(result.error!.statusCode).send(result);
+          return;
+        }
+        reply.send({
+          success: result.data!.success,
+          data: {
+            operation,
+            processed: result.data!.processed,
+            failed: result.data!.failed,
+            results: result.data!.results.map((r) =>
+              r.success && r.data
+                ? { success: true, data: this.filterUserData(r.data, UserRole.ADMIN, false) }
+                : { success: r.success, error: r.error }
+            ),
+          },
+          meta: {
+            timestamp: new Date().toISOString(),
+            requestId: request.requestContext?.requestId,
+          },
+        });
+        return;
+      }
+
+      if (operation === "update") {
+        const updates: Array<{ id: string; data: Partial<User>; version?: number }> = [];
+        for (let i = 0; i < data.length; i++) {
+          const item = bulkUpdateItemSchema.safeParse(data[i]);
+          if (!item.success) {
+            reply.code(HttpStatus.BAD_REQUEST).send({
+              success: false,
+              error: {
+                code: CrudErrorCode.VALIDATION_ERROR,
+                message: `Validation failed for item ${i}`,
+                details: item.error.issues.map((issue) => issue.message),
+                statusCode: HttpStatus.BAD_REQUEST,
+              },
+            });
+            return;
+          }
+          const { id, version, ...fields } = item.data;
+          const updateData: Partial<User> = {};
+          if (fields.username) updateData.username = fields.username;
+          if (fields.email) updateData.email = fields.email.toLowerCase();
+          if (fields.firstName) updateData.firstName = fields.firstName;
+          if (fields.lastName) updateData.lastName = fields.lastName;
+          if (fields.role) updateData.role = fields.role;
+          if (fields.status) updateData.status = fields.status;
+          updates.push({ id, data: updateData, version });
+        }
+
+        const result = await this.userService.bulkUpdate(updates, userId);
+        if (!result.success) {
+          reply.code(result.error!.statusCode).send(result);
+          return;
+        }
+        reply.send({
+          success: result.data!.success,
+          data: {
+            operation,
+            processed: result.data!.processed,
+            failed: result.data!.failed,
+            results: result.data!.results.map((r) =>
+              r.success && r.data
+                ? { success: true, data: this.filterUserData(r.data, UserRole.ADMIN, false) }
+                : { success: r.success, error: r.error }
+            ),
+          },
+          meta: {
+            timestamp: new Date().toISOString(),
+            requestId: request.requestContext?.requestId,
+          },
+        });
+        return;
+      }
+
+      // operation === "delete": data must be an array of user id strings
+      const ids: string[] = [];
+      for (let i = 0; i < data.length; i++) {
+        const value = data[i];
+        if (typeof value !== "string" || value.length === 0) {
+          reply.code(HttpStatus.BAD_REQUEST).send({
+            success: false,
+            error: {
+              code: CrudErrorCode.VALIDATION_ERROR,
+              message: `Item ${i} must be a non-empty user id string`,
+              statusCode: HttpStatus.BAD_REQUEST,
+            },
+          });
+          return;
+        }
+        ids.push(value);
+      }
+
+      const result = await this.userService.bulkDelete(ids, userId);
+      if (!result.success) {
+        reply.code(result.error!.statusCode).send(result);
+        return;
+      }
+      reply.send({
+        success: result.data!.success,
+        data: {
+          operation,
+          processed: result.data!.processed,
+          failed: result.data!.failed,
+          results: result.data!.results,
+        },
+        meta: {
+          timestamp: new Date().toISOString(),
+          requestId: request.requestContext?.requestId,
+        },
+      });
+    } catch (error) {
+      console.error("Failed bulk operation:", error);
+      this.sendInternalError(reply, CrudErrorCode.INVALID_INPUT, "Bulk operation failed");
+    }
+  }
+
+  /**
    * Private helper methods
    */
+
+  /**
+   * True if the email or the username is taken by a user OTHER than excludeId.
+   * One targeted (index-served) eq query per unique field — OR semantics.
+   */
+  private async isEmailOrUsernameTaken(
+    email?: string,
+    username?: string,
+    excludeId?: string,
+    requesterId?: string
+  ): Promise<boolean> {
+    const checks: AdvancedQuery[] = [];
+    if (email) {
+      checks.push({
+        filters: [{ field: UserField.EMAIL, operator: QueryOperator.EQ, value: email }],
+      });
+    }
+    if (username) {
+      checks.push({
+        filters: [{ field: UserField.USERNAME, operator: QueryOperator.EQ, value: username }],
+      });
+    }
+
+    for (const query of checks) {
+      if (excludeId) {
+        query.filters!.push({
+          field: BaseEntityField.ID,
+          operator: QueryOperator.NE,
+          value: excludeId,
+        });
+      }
+      const result = await this.userService.getMany(query, requesterId);
+      if (result.success && result.data!.data.length > 0) {
+        return true;
+      }
+    }
+    return false;
+  }
 
   private validateCreateUserRequest(body: CreateUserRequest): string[] {
     const errors: string[] = [];
@@ -968,7 +1229,15 @@ export class UserController {
     userRole?: UserRoleType,
     isOwnProfile: boolean = false
   ): Partial<User> {
-    const filtered: Partial<User> = { ...user };
+    // Copy nested objects we may delete from. A shallow { ...user } spread
+    // shares profile/preferences by reference with the stored entity, so
+    // `delete filtered.profile.phoneNumber` used to PERMANENTLY strip the
+    // phone number from the store the first time a non-admin viewed the user.
+    const filtered: Partial<User> = {
+      ...user,
+      profile: user.profile ? { ...user.profile } : user.profile,
+      preferences: user.preferences ? { ...user.preferences } : user.preferences,
+    };
 
     // Always remove password hash
     delete filtered.passwordHash;
@@ -983,9 +1252,6 @@ export class UserController {
       delete filtered.preferences;
 
       // Filter profile data based on privacy settings
-      if (user.preferences?.privacy?.showEmail === false) {
-        delete filtered.email;
-      }
       if (user.preferences?.privacy?.showPhone === false && filtered.profile) {
         delete filtered.profile.phoneNumber;
       }

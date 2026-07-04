@@ -436,11 +436,11 @@ export class CrudService<T extends BaseEntity> {
       const hasValidationErrors = validationResults.some((result) => result.errors.length > 0);
 
       if (hasValidationErrors) {
-        // Return validation errors for all entities
-        validationResults.forEach((result, _index) => {
+        // Return validation errors for all entities. Nothing is persisted
+        // (all-or-nothing), so processed stays 0.
+        validationResults.forEach((result) => {
           results.results.push({
             success: result.errors.length === 0,
-            data: result.errors.length === 0 ? undefined : undefined,
             error:
               result.errors.length > 0
                 ? {
@@ -508,6 +508,104 @@ export class CrudService<T extends BaseEntity> {
       return this.createErrorResponse(
         CrudErrorCode.BULK_CREATE_FAILED,
         "Failed to bulk create entities",
+        error
+      );
+    }
+  }
+
+  /**
+   * Bulk update multiple entities
+   *
+   * Why: The Repository contract always had bulkUpdate, but no service method
+   * exposed it — the HTTP bulk endpoint was a mock. Per-item isolation: one
+   * failed update does not abort the rest.
+   * When: Use for batch edits (e.g. admin bulk status changes)
+   */
+  async bulkUpdate(
+    updates: Array<{ id: string; data: Partial<T>; version?: number }>,
+    _userId?: string
+  ): Promise<ApiResponse<BulkResult<T>>> {
+    try {
+      console.error(`Bulk updating ${updates?.length ?? 0} ${this.options.entityName} records`);
+
+      if (!updates || updates.length === 0) {
+        return this.createErrorResponse(
+          CrudErrorCode.INVALID_INPUT,
+          "No updates provided for bulk update",
+          null,
+          HttpStatus.BAD_REQUEST
+        );
+      }
+
+      const results: BulkResult<T> = { success: true, processed: 0, failed: 0, results: [] };
+
+      for (const update of updates) {
+        const result = await this.update(update.id, update.data, _userId, update.version);
+        if (result.success) {
+          results.processed++;
+          results.results.push({ success: true, data: result.data });
+        } else {
+          results.failed++;
+          results.results.push({ success: false, error: result.error });
+        }
+      }
+
+      results.success = results.failed === 0;
+      return this.createSuccessResponse(results);
+    } catch (error) {
+      console.error(`Failed to bulk update ${this.options.entityName}:`, error);
+      return this.createErrorResponse(
+        CrudErrorCode.UPDATE_FAILED,
+        "Failed to bulk update entities",
+        error
+      );
+    }
+  }
+
+  /**
+   * Bulk delete multiple entities (per-item, honors softDelete)
+   *
+   * Why: Completes the bulk API surface; delete() already implements soft
+   * delete + audit, so route each id through it for consistent behavior.
+   * When: Use for batch removal (e.g. admin cleanup)
+   */
+  async bulkDelete(
+    ids: string[],
+    _userId?: string,
+    force: boolean = false
+  ): Promise<ApiResponse<BulkResult<boolean>>> {
+    try {
+      console.error(`Bulk deleting ${ids?.length ?? 0} ${this.options.entityName} records`);
+
+      if (!ids || ids.length === 0) {
+        return this.createErrorResponse(
+          CrudErrorCode.INVALID_INPUT,
+          "No ids provided for bulk delete",
+          null,
+          HttpStatus.BAD_REQUEST
+        );
+      }
+
+      const results: BulkResult<boolean> = { success: true, processed: 0, failed: 0, results: [] };
+
+      for (const id of ids) {
+        const result = await this.delete(id, _userId, force);
+        if (result.success) {
+          results.processed++;
+          results.results.push({ success: true, data: result.data });
+        } else {
+          results.failed++;
+          results.results.push({ success: false, error: result.error });
+        }
+      }
+
+      results.success = results.failed === 0;
+      return this.createSuccessResponse(results);
+    } catch (error) {
+      console.error(`Failed to bulk delete ${this.options.entityName}:`, error);
+      return this.createErrorResponse(
+        CrudErrorCode.DELETE_FAILED,
+        "Failed to bulk delete entities",
         error
       );
     }
@@ -636,6 +734,19 @@ export class CrudService<T extends BaseEntity> {
       sanitized.sort = query.sort.filter(
         (sort) => sort.field && ["asc", "desc"].includes(sort.order)
       );
+    }
+
+    // Preserve search — previously dropped here, so every controller that set
+    // query.search (e.g. GET /users?search=) had its search term silently
+    // discarded before reaching the repository and matched all rows.
+    if (query.search && typeof query.search.q === "string" && query.search.q.length > 0) {
+      sanitized.search = {
+        q: query.search.q,
+        fields: query.search.fields?.filter(
+          (field) => typeof field === "string" && field.length > 0
+        ),
+        filters: query.search.filters,
+      };
     }
 
     // Sanitize field selection

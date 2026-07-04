@@ -149,6 +149,12 @@ export class StreamingService extends EventEmitter {
   private connectionInfo = new Map<string, ConnectionInfo>();
   private rooms = new Map<string, StreamRoom>();
   private subscriptions = new Map<string, StreamSubscription>();
+  /** topic -> connectionIds with at least one subscription on that topic.
+   *  Turns topic broadcasts from O(connections x subscriptions) scans into
+   *  O(subscribers) lookups. */
+  private topicIndex = new Map<string, Set<string>>();
+  /** subscriptionId -> owning connectionId (for index maintenance). */
+  private subscriptionOwner = new Map<string, string>();
   private options: StreamingOptions;
   private heartbeatTimer?: NodeJS.Timeout;
 
@@ -369,7 +375,13 @@ export class StreamingService extends EventEmitter {
     };
 
     this.subscriptions.set(subscription.id, subscription);
+    this.subscriptionOwner.set(subscription.id, connectionId);
     info.subscriptions.add(subscription.id);
+
+    // Maintain the topic index for O(subscribers) broadcasts.
+    const topicSubscribers = this.topicIndex.get(topic);
+    if (topicSubscribers) topicSubscribers.add(connectionId);
+    else this.topicIndex.set(topic, new Set([connectionId]));
 
     console.warn(`📡 Subscription created: ${connectionId} -> ${topic}`);
 
@@ -392,6 +404,38 @@ export class StreamingService extends EventEmitter {
   }
 
   /**
+   * Remove one subscription and keep subscriptionOwner + topicIndex consistent.
+   * The connection stays in the topic index only while it still has another
+   * subscription on the same topic.
+   */
+  private removeSubscription(subscriptionId: string, connectionId: string): void {
+    const subscription = this.subscriptions.get(subscriptionId);
+    this.subscriptions.delete(subscriptionId);
+    this.subscriptionOwner.delete(subscriptionId);
+
+    const info = this.connectionInfo.get(connectionId);
+    info?.subscriptions.delete(subscriptionId);
+
+    if (!subscription) return;
+    const { topic } = subscription;
+
+    const stillSubscribed = info
+      ? Array.from(info.subscriptions).some((subId) => {
+          const other = this.subscriptions.get(subId);
+          return other?.topic === topic;
+        })
+      : false;
+
+    if (!stillSubscribed) {
+      const topicSubscribers = this.topicIndex.get(topic);
+      if (topicSubscribers) {
+        topicSubscribers.delete(connectionId);
+        if (topicSubscribers.size === 0) this.topicIndex.delete(topic);
+      }
+    }
+  }
+
+  /**
    * Handle unsubscription requests
    */
   private async handleUnsubscribe(
@@ -403,15 +447,16 @@ export class StreamingService extends EventEmitter {
     if (!info) return;
 
     if (subscriptionId) {
-      // Unsubscribe by subscription ID
-      this.subscriptions.delete(subscriptionId);
-      info.subscriptions.delete(subscriptionId);
+      // Unsubscribe by subscription ID — only if it belongs to this connection.
+      if (this.subscriptionOwner.get(subscriptionId) === connectionId) {
+        this.removeSubscription(subscriptionId, connectionId);
+      }
     } else if (topic) {
       // Unsubscribe from all subscriptions for this topic
-      for (const [subId, subscription] of this.subscriptions) {
-        if (subscription.topic === topic && info.subscriptions.has(subId)) {
-          this.subscriptions.delete(subId);
-          info.subscriptions.delete(subId);
+      for (const subId of Array.from(info.subscriptions)) {
+        const subscription = this.subscriptions.get(subId);
+        if (subscription?.topic === topic) {
+          this.removeSubscription(subId, connectionId);
         }
       }
     }
@@ -556,6 +601,17 @@ export class StreamingService extends EventEmitter {
     const info = this.connectionInfo.get(connectionId);
     if (!info) return;
 
+    // A publish must target a room or a topic — confirming a message that
+    // went nowhere lies to the client.
+    if (!roomId && !topic) {
+      await this.sendError(
+        connectionId,
+        StreamErrorCode.INVALID_MESSAGE,
+        "Publish requires a topic or a roomId"
+      );
+      return;
+    }
+
     const streamMessage: StreamMessage<unknown> = {
       id: uuidv4(),
       type: topic || StreamEventType.MESSAGE,
@@ -566,12 +622,23 @@ export class StreamingService extends EventEmitter {
     console.warn(`📢 Publishing message: ${connectionId} -> ${topic || roomId}`);
 
     if (roomId) {
+      // Only members may publish to a room. Previously any connection could
+      // inject messages into any room without ever joining it.
+      const room = this.rooms.get(roomId);
+      if (!room || !room.connections.has(connectionId)) {
+        await this.sendError(
+          connectionId,
+          StreamErrorCode.NOT_IN_ROOM,
+          "Not a member of this room"
+        );
+        return;
+      }
+
       // Publish to room
       await this.broadcastToRoom(roomId, streamMessage, connectionId);
 
       // Store in room history
-      const room = this.rooms.get(roomId);
-      if (room && this.options.enablePersistence) {
+      if (this.options.enablePersistence) {
         room.messageHistory.push(streamMessage);
         if (room.messageHistory.length > this.options.maxMessageHistory!) {
           room.messageHistory.shift();
@@ -596,7 +663,31 @@ export class StreamingService extends EventEmitter {
   }
 
   /**
-   * Broadcast message to all subscribers of a topic
+   * True when the message passes the subscription's filters. Filters are a
+   * flat FilterQuery record matched by equality against fields of the
+   * message payload. A subscription without filters matches everything.
+   */
+  private subscriptionMatches(subscription: StreamSubscription, message: StreamMessage): boolean {
+    const filters = subscription.filters;
+    if (!filters || typeof filters !== "object") return true;
+
+    const entries = Object.entries(filters);
+    if (entries.length === 0) return true;
+
+    const payload = message.data;
+    if (!payload || typeof payload !== "object") return false;
+
+    const record = payload as Record<string, unknown>;
+    return entries.every(([key, expected]) => record[key] === expected);
+  }
+
+  /**
+   * Broadcast message to all subscribers of a topic.
+   *
+   * Uses the topic index: O(subscribers) instead of walking every connection
+   * and re-resolving each of its subscription ids on every broadcast.
+   * Subscription filters (advertised in STREAM_CAPABILITIES but previously
+   * never evaluated) are applied here.
    */
   async broadcastToTopic(
     topic: string,
@@ -605,18 +696,36 @@ export class StreamingService extends EventEmitter {
   ): Promise<void> {
     console.warn(`📡 Broadcasting to topic: ${topic}`);
 
+    const subscribers = this.topicIndex.get(topic);
+    if (!subscribers || subscribers.size === 0) {
+      console.warn(`📡 Broadcast sent to 0 connections`);
+      return;
+    }
+
     let sentCount = 0;
 
-    for (const [connectionId, info] of this.connectionInfo) {
+    for (const connectionId of subscribers) {
       if (excludeConnection && connectionId === excludeConnection) continue;
 
-      // Check if connection has subscriptions to this topic
-      const hasSubscription = Array.from(info.subscriptions).some((subId) => {
-        const subscription = this.subscriptions.get(subId);
-        return subscription && subscription.topic === topic;
-      });
+      const info = this.connectionInfo.get(connectionId);
+      if (!info) continue;
 
-      if (hasSubscription) {
+      // Deliver when at least one of this connection's subscriptions on the
+      // topic passes its filters.
+      let matches = false;
+      for (const subId of info.subscriptions) {
+        const subscription = this.subscriptions.get(subId);
+        if (
+          subscription &&
+          subscription.topic === topic &&
+          this.subscriptionMatches(subscription, message)
+        ) {
+          matches = true;
+          break;
+        }
+      }
+
+      if (matches) {
         await this.sendToConnection(connectionId, message);
         sentCount++;
       }
@@ -729,10 +838,10 @@ export class StreamingService extends EventEmitter {
   private handleDisconnection(connectionId: string): void {
     const info = this.connectionInfo.get(connectionId);
 
-    // Clean up subscriptions
+    // Clean up subscriptions (also maintains subscriptionOwner + topicIndex)
     if (info) {
-      for (const subscriptionId of info.subscriptions) {
-        this.subscriptions.delete(subscriptionId);
+      for (const subscriptionId of Array.from(info.subscriptions)) {
+        this.removeSubscription(subscriptionId, connectionId);
       }
     }
 
@@ -781,6 +890,18 @@ export class StreamingService extends EventEmitter {
 
         if (timeSinceActivity > timeout) {
           console.warn(`💔 Connection timeout: ${connectionId}`);
+          // Actually close the socket before dropping tracking state.
+          // Previously the reap only removed bookkeeping, leaving the TCP
+          // connection open forever — a slow socket leak of exactly the
+          // clients that stopped responding.
+          const connection = this.connections.get(connectionId);
+          if (connection) {
+            try {
+              connection.socket.close(WS_CLOSE_POLICY_VIOLATION, "Connection timeout");
+            } catch (error) {
+              console.error(`Error closing timed-out connection ${connectionId}:`, error);
+            }
+          }
           this.handleDisconnection(connectionId);
         } else {
           // Send ping to check if connection is alive
@@ -791,6 +912,10 @@ export class StreamingService extends EventEmitter {
         }
       }
     }, this.options.heartbeatInterval);
+
+    // The heartbeat must not keep an otherwise-finished process alive
+    // (e.g. test runners with --detectOpenHandles).
+    this.heartbeatTimer.unref?.();
   }
 
   /**
@@ -835,6 +960,8 @@ export class StreamingService extends EventEmitter {
     this.connectionInfo.clear();
     this.rooms.clear();
     this.subscriptions.clear();
+    this.subscriptionOwner.clear();
+    this.topicIndex.clear();
 
     console.warn("✅ StreamingService shutdown complete");
   }
