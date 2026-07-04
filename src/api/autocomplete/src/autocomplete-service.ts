@@ -16,7 +16,6 @@
 import { SearchEngine } from "./search-engine";
 import { CacheManager, createCacheProvider } from "./cache-manager";
 import { DataSourceManager, createDataSource } from "./data-source";
-import debounce from "lodash.debounce";
 import {
   AutocompleteItem,
   AutocompleteRequest,
@@ -35,8 +34,21 @@ export class AutocompleteService {
   private lastIndexRebuild = new Date();
   private indexRebuildTimer?: NodeJS.Timeout;
 
-  // Debounced search function for performance
-  private debouncedSearch: (request: AutocompleteRequest) => Promise<AutocompleteResponse>;
+  /**
+   * Single-flight map: identical concurrent requests share one in-flight
+   * search instead of each hitting the engine (classic cache-stampede guard).
+   *
+   * This replaces the previous lodash.debounce wrapper, which was a genuine
+   * correctness bug on a server: per lodash's documented contract,
+   * "subsequent calls to the debounced function return the result of the
+   * LAST func invocation" - and undefined before the first invocation ever
+   * runs. Debouncing the shared request path therefore (a) returned
+   * `undefined` responses during the wait window and (b) leaked one user's
+   * search response to a different user whose request arrived in the same
+   * window. Debounce belongs on the client keystroke, never on the server
+   * request path.
+   */
+  private inflight = new Map<string, Promise<AutocompleteResponse>>();
 
   constructor(config: AutocompleteConfig) {
     this.config = config;
@@ -52,15 +64,6 @@ export class AutocompleteService {
 
     // Initialize data source manager
     this.dataSourceManager = new DataSourceManager();
-
-    // Create debounced search function
-    const debouncedFn = debounce(this.performSearch.bind(this), config.api.debounceMs || 300);
-
-    // Wrapper to ensure we always return a Promise
-    this.debouncedSearch = async (request: AutocompleteRequest): Promise<AutocompleteResponse> => {
-      const result = await debouncedFn(request);
-      return result as AutocompleteResponse;
-    };
 
     console.warn("🚀 AutocompleteService initialized");
   }
@@ -105,12 +108,21 @@ export class AutocompleteService {
     // Validate request
     this.validateRequest(request);
 
-    // Use debounced search for better performance
-    if (this.config.api.debounceMs > 0) {
-      return this.debouncedSearch(request);
-    } else {
-      return this.performSearch(request);
+    // Single-flight: coalesce identical concurrent requests onto one search.
+    // Distinct requests always run independently and each caller always
+    // receives the response for ITS OWN request. (config.api.debounceMs is
+    // intentionally ignored on the server path - see the `inflight` docs.)
+    const key = this.cacheManager.generateCacheKey(request);
+    const existing = this.inflight.get(key);
+    if (existing) {
+      return existing;
     }
+
+    const pending = this.performSearch(request).finally(() => {
+      this.inflight.delete(key);
+    });
+    this.inflight.set(key, pending);
+    return pending;
   }
 
   /**
@@ -324,6 +336,9 @@ export class AutocompleteService {
       }
     }, this.config.index.rebuildInterval);
 
+    // Background maintenance must not keep the Node.js process alive
+    this.indexRebuildTimer.unref?.();
+
     console.warn(`⏰ Scheduled index rebuild every ${this.config.index.rebuildInterval}ms`);
   }
 
@@ -435,17 +450,8 @@ export class AutocompleteService {
       this.searchEngine.updateConfig(newConfig.search);
     }
 
-    // Recreate debounced search if debounce time changed
-    if (newConfig.api?.debounceMs !== undefined) {
-      const debouncedFn = debounce(this.performSearch.bind(this), newConfig.api.debounceMs);
-
-      this.debouncedSearch = async (
-        request: AutocompleteRequest
-      ): Promise<AutocompleteResponse> => {
-        const result = await debouncedFn(request);
-        return result as AutocompleteResponse;
-      };
-    }
+    // Note: api.debounceMs is accepted for backward compatibility but is not
+    // applied on the server request path (see `inflight` docs above).
 
     console.warn("⚙️ Service configuration updated");
   }

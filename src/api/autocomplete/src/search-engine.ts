@@ -25,6 +25,7 @@ import {
   IndexStats,
 } from "./types.js";
 import { SearchLimit } from "./constants";
+import { PrefixIndex } from "./prefix-index";
 
 /** Result item shape from Fuse.search() - mirrors Fuse.js FuseResult for ESM compatibility */
 interface FuseResultItem {
@@ -42,6 +43,7 @@ type FuseResultMatchItem = NonNullable<FuseResultItem["matches"]>[number];
 
 export class SearchEngine {
   private fuseIndex: Fuse<AutocompleteItem> | null = null;
+  private prefixIndex: PrefixIndex = new PrefixIndex();
   private items: AutocompleteItem[] = [];
   private config: SearchConfig;
   private analytics: SearchAnalytics[] = [];
@@ -105,6 +107,9 @@ export class SearchEngine {
       ignoreFieldNorm: this.config.ignoreFieldNorm,
     });
 
+    // Build the trie for O(|prefix| + k) prefix lookups.
+    this.prefixIndex.build(this.items);
+
     const buildTime = Date.now() - startTime;
 
     // Update index statistics
@@ -140,8 +145,14 @@ export class SearchEngine {
     // Perform the actual search
     const searchResults = await this.performSearch(sanitizedRequest, searchStrategy);
 
-    // Apply post-processing filters
-    const filteredResults = this.applyFilters(searchResults, sanitizedRequest);
+    // Apply post-processing filters, THEN the limit. Limiting before
+    // filtering (the old order) silently dropped matching items: a category
+    // filter could return 0 results even though matching items existed just
+    // past the pre-filter cutoff.
+    const filteredResults = this.applyFilters(searchResults, sanitizedRequest).slice(
+      0,
+      sanitizedRequest.limit || SearchLimit.DEFAULT_LIMIT
+    );
 
     // Generate query suggestions if results are limited
     const suggestions = await this.generateSuggestions(sanitizedRequest, filteredResults);
@@ -187,7 +198,9 @@ export class SearchEngine {
       category: request.category?.trim(),
       tags: request.tags?.map((tag) => tag.trim().toLowerCase()),
       fuzzy: request.fuzzy !== false, // Default to true
-      threshold: Math.max(0, Math.min(1, request.threshold || this.config.threshold)),
+      // ?? (not ||): threshold 0 means "exact matches only" and must survive.
+      // `request.threshold || default` silently replaced 0 with the default.
+      threshold: Math.max(0, Math.min(1, request.threshold ?? this.config.threshold)),
     };
   }
 
@@ -223,37 +236,55 @@ export class SearchEngine {
     request: AutocompleteRequest,
     strategy: "exact" | "fuzzy" | "prefix"
   ): Promise<SearchResult[]> {
-    let fuseResults: FuseResultItem[] = [];
     const limit = request.limit || SearchLimit.DEFAULT_LIMIT;
 
-    switch (strategy) {
-      case "exact":
-        // For exact search, use a very low threshold
-        fuseResults = this.fuseIndex!.search(request.query, {
-          limit: limit,
-        }) as FuseResultItem[];
-        break;
+    // If category/tag/threshold filters will run AFTER this retrieval, we must
+    // retrieve more than `limit` candidates or the filters can starve
+    // legitimate matches that sit past the cutoff.
+    // (threshold is deliberately excluded: results are score-sorted, so a
+    // score cutoff applied to the top-k window can never starve matches)
+    const hasPostFilters = !!(request.category || (request.tags && request.tags.length > 0));
+    const retrieveLimit = hasPostFilters ? this.items.length : limit;
 
-      case "prefix":
-        // For prefix search, look for items that start with the query
-        fuseResults = this.fuseIndex!.search(`^${request.query}`, {
-          limit: limit,
-        }) as FuseResultItem[];
+    let results: SearchResult[];
+
+    switch (strategy) {
+      case "exact": {
+        // Previously "exact" ran the same fuzzy Fuse search as everything
+        // else. Now it is an actual exact phrase match (quotes stripped)
+        // over title, description, and tags.
+        const phrase = request.query.replace(/["']/g, "").trim();
+        results = [];
+        for (const item of this.items) {
+          const haystacks = [item.title, item.description || "", ...(item.tags || [])];
+          if (haystacks.some((h) => h.toLowerCase().includes(phrase))) {
+            results.push(this.buildDirectResult(item, phrase));
+            if (results.length >= retrieveLimit) break;
+          }
+        }
         break;
+      }
+
+      case "prefix": {
+        // Trie lookup: O(|prefix| + k). The old code passed `^query` to
+        // Fuse.js, but the `^` operator requires useExtendedSearch: true
+        // (never set), so the caret was fuzzy-matched as a literal char.
+        const items = this.prefixIndex.search(request.query, retrieveLimit);
+        results = items.map((item) => this.buildDirectResult(item, request.query));
+        break;
+      }
 
       case "fuzzy":
-      default:
-        // Standard fuzzy search
-        fuseResults = this.fuseIndex!.search(request.query, {
-          limit: limit,
+      default: {
+        const fuseResults = this.fuseIndex!.search(request.query, {
+          limit: retrieveLimit,
         }) as FuseResultItem[];
+        results = fuseResults.map((fuseResult) =>
+          this.convertFuseResult(fuseResult, request.query)
+        );
         break;
+      }
     }
-
-    // Prefer exact title matches when query length >= 4
-    const results = fuseResults.map((fuseResult) =>
-      this.convertFuseResult(fuseResult, request.query)
-    );
     if (request.query.length >= 4) {
       results.sort((a, b) => {
         const aTitleExact = a.item.title.toLowerCase() === request.query.toLowerCase() ? -1 : 0;
@@ -304,33 +335,79 @@ export class SearchEngine {
   }
 
   /**
-   * Apply highlighting to matched text
+   * Escape HTML special characters. Highlighted fields are HTML fragments
+   * (they contain <mark> tags), so item data MUST be escaped before marks
+   * are inserted or any item whose title/description contains markup becomes
+   * a stored-XSS vector when the frontend renders the fragment.
+   */
+  private escapeHtml(text: string): string {
+    return text
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
+  /**
+   * Build a SearchResult directly from an item (prefix/exact strategies),
+   * highlighting the first case-insensitive occurrence of the query.
+   */
+  private buildDirectResult(item: AutocompleteItem, query: string): SearchResult {
+    const highlight = (text: string | undefined): string | undefined => {
+      if (text === undefined) return undefined;
+      const idx = query ? text.toLowerCase().indexOf(query.toLowerCase()) : -1;
+      if (idx < 0) return this.escapeHtml(text);
+      return (
+        this.escapeHtml(text.slice(0, idx)) +
+        `<mark>${this.escapeHtml(text.slice(idx, idx + query.length))}</mark>` +
+        this.escapeHtml(text.slice(idx + query.length))
+      );
+    };
+
+    return {
+      item,
+      score: 0, // Direct (non-fuzzy) matches are perfect matches in Fuse terms
+      matches: [],
+      highlightedTitle: highlight(item.title),
+      highlightedDescription: highlight(item.description),
+    };
+  }
+
+  /**
+   * Apply highlighting to matched text.
+   * Escapes HTML (see escapeHtml) and merges overlapping match ranges so the
+   * output never contains nested/broken <mark> tags.
    */
   private highlightMatches(text: string, match?: FuseResultMatchItem): string {
     if (!match || !match.indices || match.indices.length === 0) {
-      return text;
+      return this.escapeHtml(text);
+    }
+
+    // Sort, then merge overlapping/adjacent ranges
+    const sorted = [...match.indices].sort(
+      (a: readonly [number, number], b: readonly [number, number]) => a[0] - b[0]
+    );
+    const merged: Array<[number, number]> = [];
+    for (const [start, end] of sorted) {
+      const last = merged[merged.length - 1];
+      if (last && start <= last[1] + 1) {
+        last[1] = Math.max(last[1], end);
+      } else {
+        merged.push([start, end]);
+      }
     }
 
     let highlightedText = "";
     let lastIndex = 0;
 
-    // Sort indices to process them in order
-    const sortedIndices = [...match.indices].sort(
-      (a: readonly [number, number], b: readonly [number, number]) => a[0] - b[0]
-    );
-
-    for (const [start, end] of sortedIndices) {
-      // Add text before the match
-      highlightedText += text.slice(lastIndex, start);
-
-      // Add highlighted match
-      highlightedText += `<mark>${text.slice(start, end + 1)}</mark>`;
-
+    for (const [start, end] of merged) {
+      highlightedText += this.escapeHtml(text.slice(lastIndex, start));
+      highlightedText += `<mark>${this.escapeHtml(text.slice(start, end + 1))}</mark>`;
       lastIndex = end + 1;
     }
 
-    // Add remaining text
-    highlightedText += text.slice(lastIndex);
+    highlightedText += this.escapeHtml(text.slice(lastIndex));
 
     return highlightedText;
   }
@@ -357,8 +434,9 @@ export class SearchEngine {
       );
     }
 
-    // Apply score threshold
-    if (request.threshold) {
+    // Apply score threshold (!== undefined, not truthiness: threshold 0
+    // means "perfect matches only" and was previously skipped entirely)
+    if (request.threshold !== undefined) {
       filteredResults = filteredResults.filter(
         (result) => result.score <= request.threshold! // Lower score = better match in Fuse.js
       );
@@ -457,9 +535,13 @@ export class SearchEngine {
     const existing = this.indexStats.popularQueries.find((pq) => pq.query === query);
 
     if (existing) {
-      existing.count++;
+      // True running mean. The old formula ((avg + latest) / 2) is an
+      // exponentially-weighted drift, not an average: after N searches the
+      // first sample's weight is 1/2^(N-1).
+      const latest = this.analytics[this.analytics.length - 1].executionTime;
       existing.avgExecutionTime =
-        (existing.avgExecutionTime + this.analytics[this.analytics.length - 1].executionTime) / 2;
+        (existing.avgExecutionTime * existing.count + latest) / (existing.count + 1);
+      existing.count++;
     } else {
       this.indexStats.popularQueries.push({
         query,
