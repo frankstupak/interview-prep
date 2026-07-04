@@ -17,9 +17,145 @@ import {
  * Core validation engine class
  * Provides comprehensive validation capabilities with Zod integration
  */
+/** How unknown object keys should be handled for a given validation call. */
+type UnknownKeysMode = "strip" | "passthrough" | "strict" | "none";
+
 export class ValidationEngine {
   private metrics: ValidationMetrics;
   private config: ValidationConfig;
+
+  /**
+   * Cache of unknown-keys-configured schema variants, keyed by original schema.
+   * Why: schema.strip()/.strict()/.passthrough() each allocate a brand-new schema
+   * object. Doing that on every validate() call is pure per-request garbage; schemas
+   * are module-level constants, so a WeakMap cache is safe and always hits after first use.
+   */
+  private static readonly configuredSchemaCache = new WeakMap<
+    z.ZodTypeAny,
+    Map<string, z.ZodTypeAny>
+  >();
+
+  /**
+   * Tracks whether a schema can be parsed synchronously (no async refinements
+   * or transforms). Lets validate() skip the Promise.race + setTimeout machinery
+   * entirely for the common all-sync case.
+   */
+  private static readonly syncParseCache = new WeakMap<z.ZodTypeAny, boolean>();
+
+  /**
+   * Static asyncness analysis: returns true only when the schema tree provably
+   * contains no node that can perform async work. Conservative by design —
+   * any ZodEffects (refine/superRefine/transform/preprocess — asyncness is a
+   * runtime property of the callback, undetectable statically), ZodPromise,
+   * ZodLazy (may recurse into anything), ZodFunction, or unrecognized node
+   * type routes the schema to the async parse path, which is always correct.
+   */
+  private static isDefinitelySync(schema: z.ZodTypeAny): boolean {
+    const def = schema._def as { typeName?: z.ZodFirstPartyTypeKind } & Record<string, unknown>;
+    switch (def.typeName) {
+      // Leaf types: always sync.
+      case z.ZodFirstPartyTypeKind.ZodString:
+      case z.ZodFirstPartyTypeKind.ZodNumber:
+      case z.ZodFirstPartyTypeKind.ZodBigInt:
+      case z.ZodFirstPartyTypeKind.ZodBoolean:
+      case z.ZodFirstPartyTypeKind.ZodDate:
+      case z.ZodFirstPartyTypeKind.ZodSymbol:
+      case z.ZodFirstPartyTypeKind.ZodUndefined:
+      case z.ZodFirstPartyTypeKind.ZodNull:
+      case z.ZodFirstPartyTypeKind.ZodAny:
+      case z.ZodFirstPartyTypeKind.ZodUnknown:
+      case z.ZodFirstPartyTypeKind.ZodNever:
+      case z.ZodFirstPartyTypeKind.ZodVoid:
+      case z.ZodFirstPartyTypeKind.ZodLiteral:
+      case z.ZodFirstPartyTypeKind.ZodEnum:
+      case z.ZodFirstPartyTypeKind.ZodNativeEnum:
+      case z.ZodFirstPartyTypeKind.ZodNaN:
+        return true;
+
+      case z.ZodFirstPartyTypeKind.ZodObject: {
+        const obj = schema as z.ZodObject<z.ZodRawShape>;
+        const shape = obj.shape;
+        for (const key of Object.keys(shape)) {
+          if (!ValidationEngine.isDefinitelySync(shape[key])) {
+            return false;
+          }
+        }
+        const catchall = (obj._def as { catchall?: z.ZodTypeAny }).catchall;
+        if (
+          catchall &&
+          (catchall._def as { typeName?: z.ZodFirstPartyTypeKind }).typeName !==
+            z.ZodFirstPartyTypeKind.ZodNever
+        ) {
+          return ValidationEngine.isDefinitelySync(catchall);
+        }
+        return true;
+      }
+
+      case z.ZodFirstPartyTypeKind.ZodArray:
+        return ValidationEngine.isDefinitelySync((def.type as z.ZodTypeAny) ?? z.never());
+
+      case z.ZodFirstPartyTypeKind.ZodUnion:
+      case z.ZodFirstPartyTypeKind.ZodDiscriminatedUnion: {
+        const options = def.options as z.ZodTypeAny[] | Map<unknown, z.ZodTypeAny>;
+        const list = Array.isArray(options) ? options : Array.from(options.values());
+        return list.every((o) => ValidationEngine.isDefinitelySync(o));
+      }
+
+      case z.ZodFirstPartyTypeKind.ZodIntersection:
+        return (
+          ValidationEngine.isDefinitelySync(def.left as z.ZodTypeAny) &&
+          ValidationEngine.isDefinitelySync(def.right as z.ZodTypeAny)
+        );
+
+      case z.ZodFirstPartyTypeKind.ZodTuple: {
+        const items = (def.items as z.ZodTypeAny[]) ?? [];
+        if (!items.every((i) => ValidationEngine.isDefinitelySync(i))) {
+          return false;
+        }
+        const rest = def.rest as z.ZodTypeAny | null | undefined;
+        return rest ? ValidationEngine.isDefinitelySync(rest) : true;
+      }
+
+      case z.ZodFirstPartyTypeKind.ZodRecord:
+        return (
+          (!def.keyType || ValidationEngine.isDefinitelySync(def.keyType as z.ZodTypeAny)) &&
+          ValidationEngine.isDefinitelySync(def.valueType as z.ZodTypeAny)
+        );
+
+      case z.ZodFirstPartyTypeKind.ZodMap:
+        return (
+          ValidationEngine.isDefinitelySync(def.keyType as z.ZodTypeAny) &&
+          ValidationEngine.isDefinitelySync(def.valueType as z.ZodTypeAny)
+        );
+
+      case z.ZodFirstPartyTypeKind.ZodSet:
+        return ValidationEngine.isDefinitelySync(def.valueType as z.ZodTypeAny);
+
+      // Single-child wrappers: sync iff the child is sync.
+      case z.ZodFirstPartyTypeKind.ZodOptional:
+      case z.ZodFirstPartyTypeKind.ZodNullable:
+        return ValidationEngine.isDefinitelySync(def.innerType as z.ZodTypeAny);
+      case z.ZodFirstPartyTypeKind.ZodDefault:
+      case z.ZodFirstPartyTypeKind.ZodCatch:
+      case z.ZodFirstPartyTypeKind.ZodReadonly:
+        return ValidationEngine.isDefinitelySync(def.innerType as z.ZodTypeAny);
+      case z.ZodFirstPartyTypeKind.ZodBranded:
+        return ValidationEngine.isDefinitelySync(def.type as z.ZodTypeAny);
+      case z.ZodFirstPartyTypeKind.ZodPipeline:
+        return (
+          ValidationEngine.isDefinitelySync(def.in as z.ZodTypeAny) &&
+          ValidationEngine.isDefinitelySync(def.out as z.ZodTypeAny)
+        );
+
+      // Potentially async or unbounded: always route to the async path.
+      case z.ZodFirstPartyTypeKind.ZodEffects:
+      case z.ZodFirstPartyTypeKind.ZodPromise:
+      case z.ZodFirstPartyTypeKind.ZodLazy:
+      case z.ZodFirstPartyTypeKind.ZodFunction:
+      default:
+        return false;
+    }
+  }
 
   constructor(config?: Partial<ValidationConfig>) {
     // Initialize default configuration
@@ -57,7 +193,7 @@ export class ValidationEngine {
    * Core validation method with comprehensive error handling
    */
   async validate<T>(
-    schema: z.ZodSchema<T>,
+    schema: z.ZodType<T, z.ZodTypeDef, unknown>,
     data: unknown,
     options?: ValidationOptions,
     context?: ValidationContext
@@ -73,45 +209,79 @@ export class ValidationEngine {
         ...options,
       };
 
+      // Track whether the CALLER explicitly chose an unknown-keys behavior.
+      // Why: an explicit caller choice may override a schema's own .strict()
+      // declaration, but engine defaults must never silently downgrade it.
+      const explicitUnknownKeys =
+        options != null && ("stripUnknown" in options || "allowUnknown" in options);
+
       // Update metrics
       // Why: Track validation attempts for monitoring
       if (this.config.enableMetrics) {
         this.metrics.totalValidations++;
       }
 
-      // Apply validation options to schema
-      // Why: Configure Zod behavior based on validation requirements
-      let configuredSchema = schema;
+      // Resolve unknown-keys mode with well-defined precedence:
+      // allowUnknown > stripUnknown > strict. Previously the if-chain checked
+      // stripUnknown first, so `{ allowUnknown: true }` alone was silently
+      // ignored (default stripUnknown=true won). allowUnknown is the most
+      // specific intent, so it wins.
+      const mode: UnknownKeysMode = validationOptions.allowUnknown
+        ? "passthrough"
+        : validationOptions.stripUnknown
+          ? "strip"
+          : "strict";
 
-      if (validationOptions.stripUnknown) {
-        // Use native Zod .strip() method to remove unknown properties
-        // This is the correct way to handle unknown properties in Zod
-        if (schema instanceof z.ZodObject) {
-          configuredSchema = schema.strip() as unknown as z.ZodSchema<T>;
-        }
-      } else if (validationOptions.allowUnknown) {
-        // Use native Zod .passthrough() to allow unknown properties
-        if (schema instanceof z.ZodObject) {
-          configuredSchema = schema.passthrough() as unknown as z.ZodSchema<T>;
-        }
-      } else {
-        // Use native Zod .strict() to reject unknown properties
-        if (schema instanceof z.ZodObject) {
-          configuredSchema = schema.strict() as unknown as z.ZodSchema<T>;
-        }
+      const configuredSchema = this.applyUnknownKeysMode(
+        schema,
+        mode,
+        explicitUnknownKeys
+      ) as z.ZodType<T, z.ZodTypeDef, unknown>;
+
+      // Fast path: synchronous parse for schemas that provably contain no
+      // async work. Why: the async path costs a setTimeout + Promise.race +
+      // microtask hops per call, and typical request schemas (params, query,
+      // pagination, headers) are fully synchronous.
+      //
+      // Detection is STATIC (a one-time walk of the schema tree, cached in a
+      // WeakMap): only schemas with no ZodEffects/ZodPromise/ZodLazy/
+      // ZodFunction node anywhere can be guaranteed sync. Runtime probing via
+      // safeParse() — including zod's own ~standard.validate wrapper, which
+      // probes sync-first — is NOT safe here: on an async schema Zod starts
+      // the refinement, then throws and abandons its promise, and if that
+      // orphaned promise rejects the process dies with an unhandled
+      // rejection (verified empirically against zod 3.25).
+      let parseResult: z.SafeParseReturnType<unknown, T> | undefined;
+
+      let knownSync = ValidationEngine.syncParseCache.get(schema);
+      if (knownSync === undefined) {
+        knownSync = ValidationEngine.isDefinitelySync(schema);
+        ValidationEngine.syncParseCache.set(schema, knownSync);
       }
 
-      // Perform validation with timeout
-      // Why: Prevent validation from hanging indefinitely
-      const validationPromise = this.performValidation(configuredSchema, data, validationOptions);
-      const timeoutPromise = new Promise<never>((_, reject) => {
-        timeoutHandle = setTimeout(
-          () => reject(new Error("Validation timeout")),
-          this.config.maxValidationTime
-        );
-      });
+      if (knownSync) {
+        parseResult = configuredSchema.safeParse(data);
+      } else {
+        // Schema may perform async work — parse with a timeout guard.
+        // Why: prevent async refinements (DB lookups etc.) from hanging
+        // forever. safeParseAsync catches thrown refinement errors
+        // internally, so the losing promise in the race never surfaces an
+        // unhandled rejection.
+        const validationPromise = configuredSchema.safeParseAsync(data);
+        const timeoutPromise = new Promise<never>((_, reject) => {
+          timeoutHandle = setTimeout(
+            () => reject(new Error("Validation timeout")),
+            this.config.maxValidationTime
+          );
+        });
 
-      const result = await Promise.race([validationPromise, timeoutPromise]);
+        parseResult = await Promise.race([validationPromise, timeoutPromise]);
+      }
+
+      if (!parseResult.success) {
+        throw parseResult.error;
+      }
+      const result = parseResult.data;
 
       // Record successful validation
       // Why: Track success metrics for monitoring
@@ -128,7 +298,8 @@ export class ValidationEngine {
     } catch (error) {
       // Handle validation errors
       // Why: Provide structured error information for debugging and user feedback
-      const validationError = this.handleValidationError(error, context);
+      const mergedOptions: ValidationOptions = { ...this.config.defaultOptions, ...options };
+      const validationError = this.handleValidationError(error, context, mergedOptions);
 
       // Record failed validation
       // Why: Track failure metrics and error patterns
@@ -150,6 +321,95 @@ export class ValidationEngine {
         clearTimeout(timeoutHandle);
       }
     }
+  }
+
+  /**
+   * Apply an unknown-keys mode (strip/passthrough/strict) to a schema.
+   *
+   * Fixes three defects in the original implementation:
+   * 1. ZodEffects bypass: schemas wrapped by .refine()/.transform() (e.g. the
+   *    registration schema) are ZodEffects, not ZodObject, so `instanceof
+   *    z.ZodObject` never matched and every unknown-keys option was a silent
+   *    no-op. We now unwrap effects recursively and rebuild the wrapper around
+   *    the configured inner object.
+   * 2. Strict-schema downgrade: a schema declared `.strict()` by its author
+   *    (e.g. profileUpdate, documented "Prevent unknown fields") was replaced
+   *    with `.strip()` by the engine default, silently accepting unknown keys.
+   *    Engine DEFAULTS no longer weaken an explicit .strict(); an EXPLICIT
+   *    caller option still can.
+   * 3. Per-call allocation: .strip()/.strict()/.passthrough() each build a new
+   *    schema object. Variants are now cached per (schema, mode) in a WeakMap.
+   */
+  private applyUnknownKeysMode(
+    schema: z.ZodTypeAny,
+    mode: UnknownKeysMode,
+    explicit: boolean
+  ): z.ZodTypeAny {
+    if (mode === "none") {
+      return schema;
+    }
+
+    let cacheForSchema = ValidationEngine.configuredSchemaCache.get(schema);
+    // Explicit and non-explicit resolve differently only for .strict() schemas;
+    // cache them under distinct keys to avoid cross-contamination.
+    const cacheKey = explicit ? `explicit-${mode}` : mode;
+    const cached = cacheForSchema?.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+
+    const configured = this.buildConfiguredSchema(schema, mode, explicit);
+
+    if (!cacheForSchema) {
+      cacheForSchema = new Map();
+      ValidationEngine.configuredSchemaCache.set(schema, cacheForSchema);
+    }
+    cacheForSchema.set(cacheKey, configured);
+    return configured;
+  }
+
+  /** Build the configured variant (uncached). */
+  private buildConfiguredSchema(
+    schema: z.ZodTypeAny,
+    mode: UnknownKeysMode,
+    explicit: boolean
+  ): z.ZodTypeAny {
+    if (schema instanceof z.ZodObject) {
+      const declared = (schema._def as { unknownKeys?: string }).unknownKeys;
+      // Respect the schema author's .strict() unless the caller explicitly
+      // asked for something else.
+      if (declared === "strict" && !explicit) {
+        return schema;
+      }
+      switch (mode) {
+        case "strip":
+          return schema.strip();
+        case "passthrough":
+          return schema.passthrough();
+        case "strict":
+          return schema.strict();
+        default:
+          return schema;
+      }
+    }
+
+    if (schema instanceof z.ZodEffects) {
+      const inner = schema.innerType() as z.ZodTypeAny;
+      const configuredInner = this.buildConfiguredSchema(inner, mode, explicit);
+      if (configuredInner === inner) {
+        return schema;
+      }
+      // Rebuild the effects wrapper around the configured inner schema,
+      // preserving the original refine/transform/preprocess effect.
+      return new z.ZodEffects({
+        ...(schema._def as z.ZodEffectsDef<z.ZodTypeAny>),
+        schema: configuredInner,
+      });
+    }
+
+    // Non-object root schemas (string, array, union, ...) have no
+    // unknown-keys concept; return unchanged.
+    return schema;
   }
 
   /**
@@ -229,10 +489,11 @@ export class ValidationEngine {
    * Efficient validation of arrays or multiple objects
    */
   async validateBatch<T>(
-    schema: z.ZodSchema<T>,
+    schema: z.ZodType<T, z.ZodTypeDef, unknown>,
     dataArray: unknown[],
     options?: ValidationOptions,
-    context?: ValidationContext
+    context?: ValidationContext,
+    batchOptions?: { concurrency?: number }
   ): Promise<{
     results: ValidationOutcome<T>[];
     summary: {
@@ -242,17 +503,40 @@ export class ValidationEngine {
       errors: ValidationErrorDetail[];
     };
   }> {
-    const results: ValidationOutcome<T>[] = [];
+    const results: ValidationOutcome<T>[] = new Array(dataArray.length);
     const errors: ValidationErrorDetail[] = [];
     let successful = 0;
     let failed = 0;
 
-    // Validate each item in the batch
-    // Why: Process multiple items efficiently while collecting comprehensive results
-    for (let i = 0; i < dataArray.length; i++) {
-      const result = await this.validate(schema, dataArray[i], options, context);
-      results.push(result);
+    // Concurrency: schemas with async refinements (DB uniqueness checks, remote
+    // lookups...) previously serialized the whole batch — item N+1 could not
+    // start until item N's I/O finished. A small worker pool overlaps that I/O.
+    // Default remains 1 (sequential) for full backward compatibility; results
+    // and error ordering are index-stable either way.
+    const concurrency = Math.max(1, Math.floor(batchOptions?.concurrency ?? 1));
 
+    if (concurrency === 1) {
+      // Validate each item in the batch
+      // Why: Process multiple items efficiently while collecting comprehensive results
+      for (let i = 0; i < dataArray.length; i++) {
+        results[i] = await this.validate(schema, dataArray[i], options, context);
+      }
+    } else {
+      let nextIndex = 0;
+      const worker = async (): Promise<void> => {
+        for (let i = nextIndex++; i < dataArray.length; i = nextIndex++) {
+          results[i] = await this.validate(schema, dataArray[i], options, context);
+        }
+      };
+      await Promise.all(
+        Array.from({ length: Math.min(concurrency, dataArray.length) }, () => worker())
+      );
+    }
+
+    // Aggregate in index order so summaries are deterministic regardless of
+    // completion order.
+    for (let i = 0; i < results.length; i++) {
+      const result = results[i];
       if (result.success) {
         successful++;
       } else {
@@ -278,38 +562,25 @@ export class ValidationEngine {
   }
 
   /**
-   * Perform the actual Zod validation
-   * Internal method that handles the core validation logic
-   */
-  private async performValidation<T>(
-    schema: z.ZodSchema<T>,
-    data: unknown,
-    options: ValidationOptions
-  ): Promise<T> {
-    // Configure Zod parsing options
-    // Why: Apply validation options to control Zod behavior
-    if (options.abortEarly) {
-      // Use safeParseAsync for early abort
-      const result = await schema.safeParseAsync(data);
-      if (!result.success) {
-        throw result.error;
-      }
-      return result.data;
-    } else {
-      // Use parseAsync for complete validation
-      return await schema.parseAsync(data);
-    }
-  }
-
-  /**
    * Handle validation errors and convert to structured format
    * Transforms Zod errors into consistent error responses
    */
-  private handleValidationError(error: unknown, context?: ValidationContext): ValidationFailure {
+  private handleValidationError(
+    error: unknown,
+    context?: ValidationContext,
+    options?: ValidationOptions
+  ): ValidationFailure {
     if (error instanceof z.ZodError) {
+      // abortEarly contract: report only the first issue.
+      // Why: Zod always runs full validation (there is no mid-parse abort in
+      // Zod v3), so the previous implementation's safeParseAsync-vs-parseAsync
+      // switch changed NOTHING — abortEarly was decorative. What callers
+      // actually observe is the error payload, so we honor the option there.
+      const issues = options?.abortEarly ? error.issues.slice(0, 1) : error.issues;
+
       // Transform Zod errors to structured format
       // Why: Provide consistent, detailed error information
-      const details: ValidationErrorDetail[] = error.issues.map((issue) => ({
+      const details: ValidationErrorDetail[] = issues.map((issue) => ({
         field: issue.path.join(".") || "root",
         code: this.mapZodErrorCode(issue.code),
         message: this.getCustomErrorMessage(issue) || issue.message,
@@ -528,11 +799,13 @@ export const globalValidationEngine = new ValidationEngine();
  * Quick access to validation without creating engine instance
  */
 export async function validateData<T>(
-  schema: z.ZodSchema<T>,
+  schema: z.ZodType<T, z.ZodTypeDef, unknown>,
   data: unknown,
-  options?: ValidationOptions
+  options?: ValidationOptions,
+  context?: ValidationContext
 ): Promise<ValidationOutcome<T>> {
-  return globalValidationEngine.validate(schema, data, options);
+  // Context was previously accepted by the engine but silently dropped here.
+  return globalValidationEngine.validate(schema, data, options, context);
 }
 
 /**
@@ -540,9 +813,11 @@ export async function validateData<T>(
  * Quick access to batch validation functionality
  */
 export async function validateBatch<T>(
-  schema: z.ZodSchema<T>,
+  schema: z.ZodType<T, z.ZodTypeDef, unknown>,
   dataArray: unknown[],
-  options?: ValidationOptions
+  options?: ValidationOptions,
+  context?: ValidationContext,
+  batchOptions?: { concurrency?: number }
 ): Promise<{
   results: ValidationOutcome<T>[];
   summary: {
@@ -552,5 +827,5 @@ export async function validateBatch<T>(
     errors: ValidationErrorDetail[];
   };
 }> {
-  return globalValidationEngine.validateBatch(schema, dataArray, options);
+  return globalValidationEngine.validateBatch(schema, dataArray, options, context, batchOptions);
 }

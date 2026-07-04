@@ -31,10 +31,10 @@
   "author": "Jonathan (https://github.com/SkinnnyJay)",
   "license": "MIT",
   "dependencies": {
+    "@fastify/swagger": "^9.4.0",
     "fastify": "^5.7.4",
-    "fastify-plugin": "^4.5.1",
+    "fastify-plugin": "^5.0.1",
     "zod": "^3.22.4",
-    "fastify-zod": "^1.4.0",
     "tsx": "^4.6.2"
   },
   "devDependencies": {
