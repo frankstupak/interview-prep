@@ -46,9 +46,21 @@ export interface RolePermissions {
 
 export class RoleBasedAccessControl {
   private rolePermissions: Map<Role, Permission[]> = new Map();
+  // Set-based index kept in sync with rolePermissions. Permission checks run
+  // on EVERY authorized request, and Array.includes made each check
+  // O(roles x permissions); Set.has makes it O(roles).
+  private rolePermissionSets: Map<Role, Set<Permission>> = new Map();
 
   constructor() {
     this.initializeDefaultPermissions();
+    this.rebuildPermissionSets();
+  }
+
+  private rebuildPermissionSets(): void {
+    this.rolePermissionSets.clear();
+    for (const [role, permissions] of this.rolePermissions.entries()) {
+      this.rolePermissionSets.set(role, new Set(permissions));
+    }
   }
 
   private initializeDefaultPermissions(): void {
@@ -89,10 +101,7 @@ export class RoleBasedAccessControl {
    * Check if a user has a specific permission
    */
   hasPermission(user: User, permission: Permission): boolean {
-    return user.roles.some((role) => {
-      const permissions = this.rolePermissions.get(role);
-      return permissions?.includes(permission) ?? false;
-    });
+    return user.roles.some((role) => this.rolePermissionSets.get(role)?.has(permission) ?? false);
   }
 
   /**
@@ -129,7 +138,10 @@ export class RoleBasedAccessControl {
    * Get permissions for a specific role
    */
   getRolePermissions(role: Role): Permission[] {
-    return this.rolePermissions.get(role) || [];
+    // Return a copy: the old code handed out the live internal array, so any
+    // caller could mutate a role's permissions without going through
+    // add/removePermissionFromRole (and without the Set index noticing).
+    return [...(this.rolePermissions.get(role) || [])];
   }
 
   /**
@@ -140,6 +152,9 @@ export class RoleBasedAccessControl {
     if (!permissions.includes(permission)) {
       permissions.push(permission);
       this.rolePermissions.set(role, permissions);
+      const set = this.rolePermissionSets.get(role) ?? new Set<Permission>();
+      set.add(permission);
+      this.rolePermissionSets.set(role, set);
     }
   }
 
@@ -152,6 +167,7 @@ export class RoleBasedAccessControl {
     if (index > -1) {
       permissions.splice(index, 1);
       this.rolePermissions.set(role, permissions);
+      this.rolePermissionSets.get(role)?.delete(permission);
     }
   }
 

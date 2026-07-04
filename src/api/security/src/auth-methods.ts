@@ -29,11 +29,27 @@ export class AuthenticationManager {
   private apiKeys: Map<string, ApiKey> = new Map(); // key -> ApiKey
   private bearerTokens: Map<string, BearerToken> = new Map(); // token -> BearerToken
   private refreshTokens: Map<string, BearerToken> = new Map(); // refreshToken -> BearerToken
+  private usersByUsername: Map<string, string> = new Map(); // username -> userId
+  private usersByEmail: Map<string, string> = new Map(); // email -> userId
+  private revokedJti: Map<string, number> = new Map(); // jti -> token exp (epoch ms)
+  private dummyHash: string;
   private config: AuthConfig;
 
   constructor(config: AuthConfig) {
     this.config = config;
+    // Pre-compute the timing-parity dummy hash at the CONFIGURED cost.
+    // A hardcoded cost-12 dummy takes a measurably different time than real
+    // hashes whenever bcryptRounds != 12, which re-opens the very
+    // username-enumeration timing oracle the dummy compare is meant to close.
+    this.dummyHash = bcrypt.hashSync("lumen-dummy-password-timing-parity", config.bcryptRounds);
     this.initializeDefaultUsersSync();
+  }
+
+  /** Store a user and keep the O(1) username/email indices in sync. */
+  private indexUser(user: User): void {
+    this.users.set(user.id, user);
+    this.usersByUsername.set(user.username, user.id);
+    this.usersByEmail.set(user.email, user.id);
   }
 
   private initializeDefaultUsersSync(): void {
@@ -45,9 +61,7 @@ export class AuthenticationManager {
 
     for (const def of defaults) {
       // Avoid duplicates if constructor is called multiple times in tests
-      const exists = Array.from(this.users.values()).some(
-        (u) => u.username === def.username || u.email === def.email
-      );
+      const exists = this.usersByUsername.has(def.username) || this.usersByEmail.has(def.email);
       if (exists) continue;
 
       const passwordHash = bcrypt.hashSync(def.password, this.config.bcryptRounds);
@@ -59,16 +73,27 @@ export class AuthenticationManager {
         roles: def.roles,
         createdAt: new Date(),
       };
-      this.users.set(user.id, user);
+      this.indexUser(user);
     }
   }
 
   async registerUser(request: RegisterRequest): Promise<AuthResult> {
     try {
-      // Check if user already exists
-      const existingUser = Array.from(this.users.values()).find(
-        (u) => u.username === request.username || u.email === request.email
-      );
+      // bcrypt only uses the first 72 BYTES of input — longer passwords are
+      // silently truncated, so two passwords sharing their first 72 bytes
+      // hash identically. Reject instead of truncating (OWASP Password
+      // Storage Cheat Sheet).
+      if (Buffer.byteLength(request.password, "utf8") > 72) {
+        return {
+          success: false,
+          error: AuthErrorMessage.PASSWORD_TOO_LONG,
+        };
+      }
+
+      // Check if user already exists — O(1) via secondary indices instead of
+      // a full scan over every registered user
+      const existingUser =
+        this.usersByUsername.has(request.username) || this.usersByEmail.has(request.email);
 
       if (existingUser) {
         return {
@@ -90,7 +115,7 @@ export class AuthenticationManager {
         createdAt: new Date(),
       };
 
-      this.users.set(user.id, user);
+      this.indexUser(user);
 
       return {
         success: true,
@@ -118,15 +143,20 @@ export class AuthenticationManager {
       // Parse Basic auth header
       const base64Credentials = authHeader.replace(AuthHeaderPrefix.BASIC, "").trim();
 
-      let credentials: string;
-      try {
-        credentials = Buffer.from(base64Credentials, "base64").toString("ascii");
-      } catch {
+      // Reject non-base64 input explicitly. Buffer.from(..., "base64") never
+      // throws — it silently decodes whatever it can — so the old try/catch
+      // around it was dead code and garbage headers slipped through.
+      if (!/^[A-Za-z0-9+/]+={0,2}$/.test(base64Credentials)) {
         return {
           success: false,
           error: AuthErrorMessage.INVALID_BASIC_AUTH_HEADER,
         };
       }
+
+      // RFC 7617 credentials are UTF-8. The previous "ascii" decode masked
+      // every byte to 7 bits, so a user with any non-ASCII character in
+      // their password could NEVER authenticate via Basic auth.
+      const credentials = Buffer.from(base64Credentials, "base64").toString("utf8");
 
       if (!credentials.includes(":")) {
         return {
@@ -217,14 +247,10 @@ export class AuthenticationManager {
       // Hash the provided key to match against stored hash
       const keyHash = crypto.createHash("sha256").update(apiKey).digest("hex");
 
-      // Find the API key by hash
-      let foundApiKey: ApiKey | undefined;
-      for (const storedKey of this.apiKeys.values()) {
-        if (storedKey.keyHash === keyHash && storedKey.isActive) {
-          foundApiKey = storedKey;
-          break;
-        }
-      }
+      // The map is keyed by keyHash, so this is a direct O(1) lookup — the
+      // previous code scanned every stored key on every request.
+      const storedKey = this.apiKeys.get(keyHash);
+      const foundApiKey = storedKey && storedKey.isActive ? storedKey : undefined;
 
       if (!foundApiKey) {
         return {
@@ -314,7 +340,24 @@ export class AuthenticationManager {
   // JWT Authentication
   async authenticateJWT(token: string): Promise<AuthResult> {
     try {
-      const payload = jwt.verify(token, this.config.jwtSecret) as JWTPayload;
+      // RFC 8725 §3.1: pin an explicit algorithm allow-list. Without it, the
+      // verifier accepts whatever HMAC algorithm the attacker-controlled
+      // token header names (HS384/HS512) — the verification behavior must
+      // never be selected by the token itself.
+      const payload = jwt.verify(token, this.config.jwtSecret, {
+        algorithms: ["HS256"],
+        ...(this.config.jwtIssuer ? { issuer: this.config.jwtIssuer } : {}),
+        ...(this.config.jwtAudience ? { audience: this.config.jwtAudience } : {}),
+      }) as JWTPayload;
+
+      // Server-side revocation: tokens revoked via logout() are rejected
+      // until their natural expiry.
+      if (payload.jti && this.isJtiRevoked(payload.jti)) {
+        return {
+          success: false,
+          error: AuthErrorMessage.TOKEN_REVOKED,
+        };
+      }
 
       const user = this.users.get(payload.userId);
       if (!user) {
@@ -352,7 +395,10 @@ export class AuthenticationManager {
   }
 
   // Login and create session/JWT
-  async login(request: AuthRequest, authType: AuthType): Promise<AuthResult & { token?: string }> {
+  async login(
+    request: AuthRequest,
+    authType: AuthType
+  ): Promise<AuthResult & { token?: string; refreshToken?: string }> {
     const authResult = await this.validateCredentials(request);
 
     if (!authResult.success) {
@@ -388,6 +434,7 @@ export class AuthenticationManager {
         return {
           ...authResult,
           token: bearerToken.token,
+          refreshToken: bearerToken.refreshToken,
         };
       }
 
@@ -422,10 +469,23 @@ export class AuthenticationManager {
           };
         }
 
-        case AuthType.JWT:
-          // JWT tokens can't be invalidated server-side without a blacklist
-          // In a real implementation, you'd maintain a blacklist
+        case AuthType.JWT: {
+          // Revoke by jti until the token's natural expiry, so a logged-out
+          // JWT can no longer authenticate. Verification failures here
+          // (already-expired or garbage token) mean there is nothing left to
+          // revoke — logout is still a success.
+          try {
+            const payload = jwt.verify(token, this.config.jwtSecret, {
+              algorithms: ["HS256"],
+            }) as JWTPayload;
+            if (payload.jti && payload.exp) {
+              this.revokedJti.set(payload.jti, payload.exp * 1000);
+            }
+          } catch {
+            // nothing to revoke
+          }
           return { success: true };
+        }
 
         case AuthType.BEARER_TOKEN: {
           const bearerToken = this.bearerTokens.get(token);
@@ -467,13 +527,17 @@ export class AuthenticationManager {
 
   private async validateCredentials(request: AuthRequest): Promise<AuthResult> {
     try {
-      const user = Array.from(this.users.values()).find((u) => u.username === request.username);
+      // O(1) index lookup instead of scanning every registered user on
+      // every single login attempt.
+      const userId = this.usersByUsername.get(request.username);
+      const user = userId ? this.users.get(userId) : undefined;
 
-      // Always perform password comparison even if user not found
-      // to prevent timing attacks that can enumerate valid usernames
-      // note: you would never do this in production, you would use a dummy hash or a hash of the username hardcoded in the code.
-      const dummyHash = "$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewY5GyqK7u/fUZyK";
-      const passwordHash = user ? user.passwordHash : dummyHash;
+      // Always perform password comparison even if user not found to prevent
+      // timing attacks that enumerate valid usernames. The dummy hash is the
+      // one pre-computed in the constructor at the CONFIGURED bcrypt cost —
+      // the old hardcoded cost-12 dummy took a measurably different time
+      // than real hashes whenever bcryptRounds != 12, re-opening the oracle.
+      const passwordHash = user ? user.passwordHash : this.dummyHash;
       const isValidPassword = await bcrypt.compare(request.password, passwordHash);
 
       if (!user || !isValidPassword) {
@@ -514,10 +578,14 @@ export class AuthenticationManager {
       userId: user.id,
       username: user.username,
       roles: user.roles,
+      jti: crypto.randomUUID(), // unique token id — enables revocation on logout
     };
 
     return jwt.sign(payload, this.config.jwtSecret, {
+      algorithm: "HS256",
       expiresIn: this.config.jwtExpiresIn,
+      ...(this.config.jwtIssuer ? { issuer: this.config.jwtIssuer } : {}),
+      ...(this.config.jwtAudience ? { audience: this.config.jwtAudience } : {}),
     } as jwt.SignOptions);
   }
 
@@ -546,8 +614,67 @@ export class AuthenticationManager {
   }
 
   getUserByUsername(username: string): User | undefined {
-    const user = Array.from(this.users.values()).find((u) => u.username === username);
+    const userId = this.usersByUsername.get(username);
+    const user = userId ? this.users.get(userId) : undefined;
     return user ? sanitizeUser(user) : undefined;
+  }
+
+  /**
+   * Update a user's own mutable profile fields. Only explicitly allow-listed
+   * fields (email, username) can change — roles, id, and passwordHash are
+   * never accepted here (mass-assignment protection).
+   */
+  updateUser(userId: string, updates: { email?: string; username?: string }): AuthResult {
+    const user = this.users.get(userId);
+    if (!user) {
+      return { success: false, error: AuthErrorMessage.USER_NOT_FOUND };
+    }
+
+    if (updates.username && updates.username !== user.username) {
+      if (this.usersByUsername.has(updates.username)) {
+        return { success: false, error: AuthErrorMessage.USER_ALREADY_EXISTS };
+      }
+      this.usersByUsername.delete(user.username);
+      user.username = updates.username;
+      this.usersByUsername.set(user.username, user.id);
+    }
+
+    if (updates.email && updates.email !== user.email) {
+      if (this.usersByEmail.has(updates.email)) {
+        return { success: false, error: AuthErrorMessage.USER_ALREADY_EXISTS };
+      }
+      this.usersByEmail.delete(user.email);
+      user.email = updates.email;
+      this.usersByEmail.set(user.email, user.id);
+    }
+
+    return { success: true, user: sanitizeUser(user) };
+  }
+
+  /** True if the jti was revoked via logout and the token has not yet expired. */
+  private isJtiRevoked(jti: string): boolean {
+    const expMs = this.revokedJti.get(jti);
+    if (expMs === undefined) return false;
+    if (expMs <= Date.now()) {
+      // The token is past its natural expiry — the revocation entry is
+      // useless now, so prune it lazily.
+      this.revokedJti.delete(jti);
+      return false;
+    }
+    return true;
+  }
+
+  /** Sweep revocation entries whose tokens have expired anyway. */
+  clearExpiredRevokedJtis(): number {
+    const now = Date.now();
+    let cleared = 0;
+    for (const [jti, expMs] of this.revokedJti.entries()) {
+      if (expMs <= now) {
+        this.revokedJti.delete(jti);
+        cleared++;
+      }
+    }
+    return cleared;
   }
 
   getAllUsers(): User[] {

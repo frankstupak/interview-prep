@@ -84,6 +84,13 @@ const contentCreateBodySchema = z.object({
 
 const contentUpdateBodySchema = z.record(z.unknown());
 
+// Allow-list of self-service profile fields. Anything else in the body
+// (roles, passwordHash, id, ...) is ignored — see PUT /auth/profile.
+const profileUpdateBodySchema = z.object({
+  email: z.string().email().optional(),
+  username: z.string().min(1).optional(),
+});
+
 const apiDataPostBodySchema = z.record(z.unknown());
 
 const roleParamsSchema = z.object({
@@ -155,15 +162,18 @@ export async function createApp(): Promise<FastifyInstance> {
         authType = AuthType.BASIC;
         authResult = await authManager.authenticateBasic(authHeader);
       } else if (authHeader?.startsWith(AuthHeaderPrefix.BEARER)) {
-        // Check if it's a JWT or Bearer token by trying JWT first
-        const token = authHeader.replace(AuthHeaderPrefix.BEARER, "");
+        const token = authHeader.slice(AuthHeaderPrefix.BEARER.length);
 
-        // Try JWT first
-        authType = AuthType.JWT;
-        authResult = await authManager.authenticateJWT(token);
-
-        // If JWT fails, try Bearer token
-        if (!authResult.success) {
+        // JWTs are structurally three dot-separated segments; the opaque
+        // bearer tokens issued here never contain dots. Routing by shape
+        // (instead of try-JWT-then-fall-back) avoids a wasted signature
+        // verification on every opaque-token request AND stops masking JWT
+        // errors — an expired JWT used to be reported as
+        // "Invalid bearer token" because the fallback overwrote the result.
+        if (token.split(".").length === 3) {
+          authType = AuthType.JWT;
+          authResult = await authManager.authenticateJWT(token);
+        } else {
           authType = AuthType.BEARER_TOKEN;
           authResult = await authManager.authenticateBearerToken(token);
         }
@@ -323,9 +333,10 @@ export async function createApp(): Promise<FastifyInstance> {
       token = sessionToken;
       authType = AuthType.SESSION_TOKEN;
     } else if (authHeader?.startsWith(AuthHeaderPrefix.BEARER)) {
-      token = authHeader.replace(AuthHeaderPrefix.BEARER, "");
-      // Try to determine if it's JWT or Bearer token
-      authType = AuthType.BEARER_TOKEN; // Default to bearer token for logout
+      token = authHeader.slice(AuthHeaderPrefix.BEARER.length);
+      // Route by token shape — JWT logout now actually revokes the token
+      // instead of defaulting to a bearer-token lookup that always misses.
+      authType = token.split(".").length === 3 ? AuthType.JWT : AuthType.BEARER_TOKEN;
     } else {
       authType = AuthType.BASIC;
       token = ""; // Basic auth doesn't need token cleanup
@@ -376,15 +387,15 @@ export async function createApp(): Promise<FastifyInstance> {
         });
       }
 
-      const bearerToken = authManager
-        .getActiveBearerTokens()
-        .find((t) => t.token.startsWith(result.token?.substring(0, 8) || ""));
-
+      // The old implementation returned the literal string
+      // "hidden_for_security" as the refresh_token, which made the
+      // refresh_token grant unusable end-to-end through this endpoint.
+      // login() now returns the real refresh token for BEARER_TOKEN logins.
       return reply.send({
         access_token: result.token,
         token_type: "Bearer",
         expires_in: Math.floor(config.bearerTokenExpiresIn / 1000),
-        refresh_token: bearerToken ? "hidden_for_security" : undefined,
+        refresh_token: result.refreshToken,
         scope: "read write",
       });
     } else {
@@ -425,17 +436,27 @@ export async function createApp(): Promise<FastifyInstance> {
     { preHandler: authorize(Permission.UPDATE_USER) },
     async (request: RequestWithAuth, reply) => {
       const { user } = request.authContext!;
-      const parsed = z.record(z.unknown()).safeParse(request.body);
+      const parsed = profileUpdateBodySchema.safeParse(request.body);
       if (!parsed.success) {
         return reply.code(HttpStatus.BAD_REQUEST).send({
           error: AuthErrorCode.INVALID_REQUEST,
           message: "Invalid profile update payload",
         });
       }
-      const body = parsed.data;
+      // Mass-assignment fix: the old handler spread the raw body over the
+      // user ({ ...user, ...body }), letting a request override roles or
+      // passwordHash in the returned object — and persisted nothing. Updates
+      // now go through an allow-list and are actually stored.
+      const result = authManager.updateUser(user.id, parsed.data);
+      if (!result.success) {
+        return reply.code(HttpStatus.BAD_REQUEST).send({
+          error: AuthErrorCode.INVALID_REQUEST,
+          message: result.error,
+        });
+      }
       return reply.send({
         message: "Profile updated successfully",
-        user: { ...user, ...body, id: user.id },
+        user: result.user,
       });
     }
   );
@@ -825,7 +846,11 @@ async function startServer(): Promise<void> {
   }
 }
 
-// Start the server
-startServer().catch((err: unknown) => {
-  console.warn("Server failed to start:", err);
-});
+// Start the server only when this file is executed directly (tsx src/server.ts
+// or node dist/server.js). Importing createApp — e.g. from tests — must not
+// bind port 3000 as a side effect of the import.
+if (require.main === module) {
+  startServer().catch((err: unknown) => {
+    console.warn("Server failed to start:", err);
+  });
+}
