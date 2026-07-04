@@ -7,9 +7,9 @@
     "dev": "tsx src/server.ts",
     "start": "node ../../../dist/api/caching/server.js",
     "build": "tsc",
-    "test": "jest src/cache.test.ts --detectOpenHandles --testTimeout=90000",
+    "test": "jest src/cache.test.ts src/cache-uplift.test.ts --detectOpenHandles --testTimeout=90000",
     "test:watch": "jest src/cache.test.ts --watch",
-    "test:coverage": "jest src/cache.test.ts --coverage --testTimeout=90000",
+    "test:coverage": "jest src/cache.test.ts src/cache-uplift.test.ts --coverage --testTimeout=90000",
     "test:performance": "jest src/performance-tests.ts",
     "clean": "rm -rf ../../../dist/api/caching",
     "redis:start": "docker run -d -p 6379:6379 --name redis-cache redis:alpine",
@@ -18,7 +18,8 @@
     "lint:fix": "eslint 'src/**/*.ts' --fix && npm run format",
     "format": "prettier --write 'src/**/*.{ts,js,json}' '*.md'",
     "format:check": "prettier --check 'src/**/*.{ts,js,json}' '*.md'",
-    "openapi": "npm run build && node ../../../dist/api/caching/generate-openapi.js"
+    "openapi": "npm run build && node ../../../dist/api/caching/generate-openapi.js",
+    "bench": "tsx src/cache-bench.ts"
   },
   "keywords": [
     "caching",
@@ -53,7 +54,8 @@
       "<rootDir>/src"
     ],
     "testMatch": [
-      "**/*.test.ts"
+      "**/*.test.ts",
+      "**/performance-tests.ts"
     ],
     "collectCoverageFrom": [
       "src/**/*.ts",

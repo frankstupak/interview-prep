@@ -1,5 +1,5 @@
 // cache.test.ts - Comprehensive test suite for caching system
-import { describe, it, expect, beforeEach, afterEach } from "@jest/globals";
+import { describe, it, expect, beforeEach, afterEach, jest } from "@jest/globals";
 import {
   CacheStrategy,
   CacheOptions,
@@ -43,6 +43,7 @@ class MockRedisClient implements CacheRedisClient {
   private sortedSets = new Map<string, Array<{ score: number; member: string }>>();
   private hashes = new Map<string, Map<string, string>>();
   private frequencies = new Map<string, number>();
+  private lists = new Map<string, string[]>();
 
   async get(key: string): Promise<string | null> {
     // Check if key has expired
@@ -93,69 +94,102 @@ class MockRedisClient implements CacheRedisClient {
   }
 
   async eval(script: string, numkeys: number, ...args: string[]): Promise<unknown> {
-    // Simple mock implementation for Lua scripts
+    // Mock implementation keyed on the stable marker comment in each script
+    // (first Lua line), mirroring the real scripts' observable behavior.
     const keys = args.slice(0, numkeys);
     const argv = args.slice(numkeys);
 
-    // Mock LRU set operation
-    if (script.includes("ZADD") && script.includes("ZRANGE")) {
+    if (script.includes("-- lru-set") || script.includes("-- lfu-set")) {
       const dataKey = keys[0];
       const value = argv[0];
-      const ttl = argv[1];
+      const ttl = parseInt(argv[1]);
 
       await this.set(dataKey, value);
-      if (parseInt(ttl) > 0) {
-        this.ttls.set(dataKey, Date.now() + parseInt(ttl));
+      if (ttl > 0) {
+        this.ttls.set(dataKey, Date.now() + ttl);
       }
-
-      return [1];
-    }
-
-    // Mock LFU set operation
-    if (script.includes("ZADD") && script.includes("ZCARD") && !script.includes("ZINCRBY")) {
-      const dataKey = keys[0];
-      const value = argv[0];
-      const ttl = argv[1];
-
-      await this.set(dataKey, value);
-      if (parseInt(ttl) > 0) {
-        this.ttls.set(dataKey, Date.now() + parseInt(ttl));
-      }
-
-      // Initialize frequency to 1
-      if (!this.frequencies.has(dataKey)) {
+      // LFU: initialize frequency for NEW members only (ZADD ... NX)
+      if (script.includes("-- lfu-set") && !this.frequencies.has(dataKey)) {
         this.frequencies.set(dataKey, 1);
       }
-
       return [1];
     }
 
-    // Mock LFU get operation
-    if (script.includes("ZINCRBY") && script.includes("ZSCORE")) {
+    if (script.includes("-- lfu-get")) {
       const [dataKey] = keys;
       const value = await this.get(dataKey);
-      if (!value) return null;
-
-      const ttl = await this.ttl(dataKey);
-
-      // Increment and get frequency
-      const currentFreq = this.frequencies.get(dataKey) || 1;
-      const newFreq = currentFreq + 1;
+      if (value == null) {
+        this.frequencies.delete(dataKey); // lazy repair of stale members
+        return null;
+      }
+      const newFreq = (this.frequencies.get(dataKey) || 1) + 1;
       this.frequencies.set(dataKey, newFreq);
-
-      return [value, ttl, newFreq];
+      return [value, await this.pttlMs(dataKey), newFreq];
     }
 
-    // Mock LRU get operation
-    if (script.includes("ZADD") && keys.length === 2) {
+    if (script.includes("-- lru-get") || script.includes("-- plain-get")) {
       const [dataKey] = keys;
       const value = await this.get(dataKey);
-      const ttl = await this.ttl(dataKey);
+      if (value == null) return null;
+      return [value, await this.pttlMs(dataKey)];
+    }
 
-      return value ? [value, ttl] : null;
+    if (script.includes("-- wt-get")) {
+      const [cacheKey, storageKey] = keys;
+      const value = await this.get(cacheKey);
+      if (value != null) return [value, await this.pttlMs(cacheKey)];
+      const stored = await this.get(storageKey);
+      if (stored == null) return null;
+      await this.set(cacheKey, stored); // read-through repopulation
+      return [stored, -1];
+    }
+
+    if (script.includes("-- wt-set")) {
+      const [cacheKey, storageKey] = keys;
+      await this.set(cacheKey, argv[0]);
+      await this.set(storageKey, argv[0]);
+      const ttl = parseInt(argv[1]);
+      if (ttl > 0) this.ttls.set(cacheKey, Date.now() + ttl);
+      return [1];
+    }
+
+    if (script.includes("-- wb-set")) {
+      const [cacheKey, queueKey] = keys;
+      await this.set(cacheKey, argv[0]);
+      const ttl = parseInt(argv[1]);
+      if (ttl > 0) this.ttls.set(cacheKey, Date.now() + ttl);
+      const queue = this.lists.get(queueKey) ?? [];
+      queue.unshift(argv[2]); // LPUSH
+      this.lists.set(queueKey, queue);
+      return [1];
+    }
+
+    if (script.includes("-- wb-drain")) {
+      const [queueKey] = keys;
+      const n = parseInt(argv[0]);
+      const queue = this.lists.get(queueKey) ?? [];
+      const items: string[] = [];
+      for (let i = 0; i < n; i++) {
+        const item = queue.pop(); // RPOP
+        if (item === undefined) break;
+        items.push(item);
+      }
+      return items;
+    }
+
+    if (script.includes("ZREM")) {
+      // delete()-path cleanup scripts
+      return [1];
     }
 
     return [1, 0, 0];
+  }
+
+  // PTTL equivalent: remaining TTL in milliseconds, -1 when no TTL
+  private async pttlMs(key: string): Promise<number> {
+    const expiry = this.ttls.get(key);
+    if (!expiry) return -1;
+    return Math.max(0, expiry - Date.now());
   }
 
   async hget(key: string, field: string): Promise<string | null> {
@@ -192,6 +226,7 @@ class MockRedisClient implements CacheRedisClient {
     this.sortedSets.clear();
     this.hashes.clear();
     this.frequencies.clear();
+    this.lists.clear();
   }
 }
 
@@ -807,9 +842,9 @@ describe("🔄 Unified Cache Interface Functions", () => {
   });
 });
 
-// Skipped: Performance and Edge Cases can hang (async/timeout). See CONTRIBUTING.md § "Skipped tests / technical debt"
-// and https://github.com/SkinnnyJay/interview-prep/issues — re-enable when fixed (e.g. shorter runs, better cleanup).
-describe.skip("📊 Performance and Edge Cases", () => {
+// Re-enabled: the hang was the TTL cache's un-unref()'d cleanup setInterval
+// holding the event loop open; it is now unref()'d and destroyed by clearMemoryCacheStorage().
+describe("📊 Performance and Edge Cases", () => {
   describe("Large Dataset Handling", () => {
     it("should handle large number of cache operations", async () => {
       const cache = new LRUMemoryCache<string>(100);

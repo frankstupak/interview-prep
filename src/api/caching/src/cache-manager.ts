@@ -55,17 +55,21 @@ export class CacheManager {
       ...options,
     };
 
+    // Unsupported strategies are configuration bugs: fail loud instead of
+    // silently reporting a miss (which hides the misconfiguration forever)
+    if (!this.isMemoryStrategy(opts.strategy) && !this.isRedisStrategy(opts.strategy)) {
+      throw new Error(`Unsupported cache strategy: ${opts.strategy}`);
+    }
+
     try {
       // Route to appropriate implementation based on strategy
       if (this.isMemoryStrategy(opts.strategy)) {
         return await getFromMemoryCache<T>(opts);
-      } else if (this.isRedisStrategy(opts.strategy)) {
+      } else {
         if (!this.redis) {
           throw new Error(`Redis client required for strategy: ${opts.strategy}`);
         }
         return (await getFromRedisCache(this.redis, opts)) as CacheResult<T>;
-      } else {
-        throw new Error(`Unsupported cache strategy: ${opts.strategy}`);
       }
     } catch (error) {
       if (error instanceof Error) console.error(`Cache get error for key ${key}:`, error);
@@ -81,9 +85,11 @@ export class CacheManager {
       key,
       strategy: this.config.strategy,
       maxSize: this.config.maxSize,
-      ttl: options?.ttl ?? this.config.defaultTtl,
       nowMs: Date.now(),
       ...options,
+      // Applied AFTER the spread: a caller passing { ttl: undefined } must
+      // fall back to defaultTtl instead of clobbering it with undefined
+      ttl: options?.ttl ?? this.config.defaultTtl,
     };
 
     try {
@@ -317,9 +323,13 @@ export class MultiLevelCacheManager {
         this.l2Cache.getStats(),
       ]);
 
+      // Every request touches L1; L2 is only consulted on an L1 miss.
+      // The old formula summed l1.misses + l2.misses, so a request that
+      // missed L1 but hit L2 (a SUCCESSFUL cache hit) scored 1 hit + 1 miss
+      // = a 50% hit rate, and a full miss double-counted as 2 misses.
       const combined: CacheStats = {
         hits: l1Stats.hits + l2Stats.hits,
-        misses: l1Stats.misses + l2Stats.misses,
+        misses: l2Stats.misses,
         hitRate: 0, // Will be calculated below
         size: l1Stats.size + l2Stats.size,
         maxSize: l1Stats.maxSize + l2Stats.maxSize,
@@ -327,7 +337,7 @@ export class MultiLevelCacheManager {
         memoryUsage: (l1Stats.memoryUsage || 0) + (l2Stats.memoryUsage || 0),
       };
 
-      const totalRequests = combined.hits + combined.misses;
+      const totalRequests = l1Stats.hits + l1Stats.misses;
       combined.hitRate = totalRequests > 0 ? (combined.hits / totalRequests) * 100 : 0;
 
       return { l1: l1Stats, l2: l2Stats, combined };

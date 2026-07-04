@@ -95,6 +95,12 @@ export interface CacheRedisClient {
   hset(key: string, field: string, value: string): Promise<number>;
   hincrby(key: string, field: string, increment: number): Promise<number>;
   keys(pattern: string): Promise<string[]>;
+  /**
+   * Optional cursor-based SCAN (ioredis signature). When available, bulk
+   * operations use non-blocking SCAN instead of the O(N), event-loop-blocking
+   * KEYS command. Optional so existing client implementations keep compiling.
+   */
+  scan?(cursor: string, ...args: Array<string | number>): Promise<[string, string[]]>;
 }
 
 /**

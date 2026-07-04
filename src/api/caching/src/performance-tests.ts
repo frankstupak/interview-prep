@@ -1,5 +1,5 @@
 // performance-tests.ts - Performance benchmarks for caching strategies
-import { describe, it, expect } from "@jest/globals";
+import { describe, it, expect, beforeEach, afterEach } from "@jest/globals";
 import { CacheStrategy, CacheRedisClient } from "./cache-types";
 
 import {
