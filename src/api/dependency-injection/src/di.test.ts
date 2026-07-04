@@ -480,3 +480,245 @@ describe("Dependency Injection System", () => {
     });
   });
 });
+
+
+// ===========================================================================
+// Lumen Industries uplift — regression tests
+// Container lifecycle, circular-dependency, scoped-service, and
+// dependency-graph fixes. Each block fails on the pre-uplift container.
+// ===========================================================================
+
+describe("Uplift: circular dependencies via factory (undeclared deps)", () => {
+  it("rejects with a clean error instead of deadlocking when the cycle exists only through factory resolve()", async () => {
+    const container = new DefaultServiceContainer();
+    // dependencies array intentionally omitted — the cycle exists only through
+    // the factory's container.resolve() calls. Pre-uplift this produced a
+    // never-resolving promise (the test would hang).
+    container.registerSingleton("A", async (c) => ({ b: await c.resolve("B") }));
+    container.registerSingleton("B", async (c) => ({ a: await c.resolve("A") }));
+
+    await expect(container.resolve("A")).rejects.toThrow(/Circular dependency detected/);
+    await container.dispose();
+  });
+
+  it("still resolves a diamond (shared, non-cyclic dependency) without a false positive", async () => {
+    const container = new DefaultServiceContainer();
+    let dCount = 0;
+    container.registerSingleton("D", () => ({ id: ++dCount }));
+    container.registerSingleton("B", async (c) => ({ d: await c.resolve("D") }));
+    container.registerSingleton("C", async (c) => ({ d: await c.resolve("D") }));
+    container.registerSingleton("A", async (c) => ({
+      b: await c.resolve("B"),
+      c: await c.resolve("C"),
+    }));
+
+    const a = await container.resolve<{
+      b: { d: { id: number } };
+      c: { d: { id: number } };
+    }>("A");
+    expect(a.b.d).toBe(a.c.d); // singleton D shared across both paths
+    expect(dCount).toBe(1);
+    await container.dispose();
+  });
+
+  it("emits a CIRCULAR_DEPENDENCY event for factory-only cycles", async () => {
+    const container = new DefaultServiceContainer();
+    const events: string[] = [];
+    container.addEventListener(ContainerEvent.CIRCULAR_DEPENDENCY, (_e, data) => {
+      events.push(String(data.serviceName));
+    });
+    container.registerSingleton("X", async (c) => ({ y: await c.resolve("Y") }));
+    container.registerSingleton("Y", async (c) => ({ x: await c.resolve("X") }));
+
+    await expect(container.resolve("X")).rejects.toThrow(/Circular dependency detected/);
+    expect(events.length).toBeGreaterThan(0);
+    await container.dispose();
+  });
+});
+
+describe("Uplift: activeScopes counter no longer leaks", () => {
+  it("returns to zero after all created scopes are disposed", async () => {
+    const container = new DefaultServiceContainer();
+    container.registerScoped("s", () => ({ id: Math.random() }));
+
+    const scopes = Array.from({ length: 5 }, () => container.createScope());
+    expect(container.getStatistics().activeScopes).toBe(5);
+
+    for (const scope of scopes) {
+      await scope.resolve("s");
+    }
+    for (const scope of scopes) {
+      await scope.disposeScope();
+    }
+
+    expect(container.getStatistics().activeScopes).toBe(0);
+    await container.dispose();
+  });
+
+  it("does not underflow below zero on double dispose", async () => {
+    const container = new DefaultServiceContainer();
+    const scope = container.createScope();
+    await scope.disposeScope();
+    await scope.disposeScope(); // idempotent
+    expect(container.getStatistics().activeScopes).toBe(0);
+    await container.dispose();
+  });
+});
+
+describe("Uplift: scoped services get the full lifecycle", () => {
+  it("invokes initialize() on scoped services exactly once per scope", async () => {
+    const container = new DefaultServiceContainer();
+    const init = jest.fn();
+    class ScopedThing {
+      async initialize(): Promise<void> {
+        init();
+      }
+    }
+    container.registerScoped("thing", () => new ScopedThing());
+
+    const scope = container.createScope();
+    const a = await scope.resolve("thing");
+    const b = await scope.resolve("thing");
+    expect(a).toBe(b); // cached within the scope
+    expect(init).toHaveBeenCalledTimes(1); // and initialized exactly once
+    await scope.disposeScope();
+    await container.dispose();
+  });
+
+  it("resolves Promise-valued fields returned by a scoped factory", async () => {
+    const container = new DefaultServiceContainer();
+    container.registerSingleton("dep", () => ({ value: 42 }));
+    container.registerScoped("scopedWithDep", (c) => ({
+      dep: c.resolve("dep"), // a Promise stored as a field
+      tag: "scoped",
+    }));
+
+    const scope = container.createScope();
+    const svc = await scope.resolve<{ dep: { value: number }; tag: string }>("scopedWithDep");
+    expect(svc.tag).toBe("scoped");
+    expect(svc.dep).not.toHaveProperty("then"); // resolved value, not a pending Promise
+    expect(svc.dep.value).toBe(42);
+    await scope.disposeScope();
+    await container.dispose();
+  });
+
+  it("detects circular dependencies between two scoped services", async () => {
+    const container = new DefaultServiceContainer();
+    container.registerScoped("P", async (c) => ({ q: await c.resolve("Q") }));
+    container.registerScoped("Q", async (c) => ({ p: await c.resolve("P") }));
+    const scope = container.createScope();
+    await expect(scope.resolve("P")).rejects.toThrow(/Circular dependency detected/);
+    await scope.disposeScope();
+    await container.dispose();
+  });
+});
+
+describe("Uplift: dependency-graph cycle detection is accurate", () => {
+  const reg = (container: DefaultServiceContainer, name: string, dep?: string): void => {
+    container.register({
+      name,
+      factory: () => ({}),
+      lifetime: ServiceLifetime.SINGLETON,
+      dependencies: dep ? [dep] : undefined,
+    });
+  };
+
+  it("reports a 2-node cycle exactly once with no spurious prefix", () => {
+    const container = new DefaultServiceContainer();
+    reg(container, "A", "B");
+    reg(container, "B", "A");
+    const graph = container.buildDependencyGraph();
+    expect(graph.cycles).toHaveLength(1);
+    expect(new Set(graph.cycles[0])).toEqual(new Set(["A", "B"]));
+  });
+
+  it("reports a 3-node cycle once", () => {
+    const container = new DefaultServiceContainer();
+    reg(container, "A", "B");
+    reg(container, "B", "C");
+    reg(container, "C", "A");
+    const graph = container.buildDependencyGraph();
+    expect(graph.cycles).toHaveLength(1);
+    expect(new Set(graph.cycles[0])).toEqual(new Set(["A", "B", "C"]));
+  });
+
+  it("reports no cycles for an acyclic graph", () => {
+    const container = new DefaultServiceContainer();
+    reg(container, "root");
+    reg(container, "mid", "root");
+    reg(container, "leaf", "mid");
+    const graph = container.buildDependencyGraph();
+    expect(graph.cycles).toHaveLength(0);
+  });
+
+  it("reports two independent cycles separately", () => {
+    const container = new DefaultServiceContainer();
+    reg(container, "A", "B");
+    reg(container, "B", "A");
+    reg(container, "C", "D");
+    reg(container, "D", "C");
+    const graph = container.buildDependencyGraph();
+    expect(graph.cycles).toHaveLength(2);
+  });
+});
+
+describe("Uplift: resolveAll tag index preserves behavior", () => {
+  it("returns all services for a tag and [] for an unknown tag", async () => {
+    const container = new DefaultServiceContainer();
+    container.register({
+      name: "h1",
+      factory: () => ({ t: "email" }),
+      lifetime: ServiceLifetime.TRANSIENT,
+      tags: ["handler", "io"],
+    });
+    container.register({
+      name: "h2",
+      factory: () => ({ t: "sms" }),
+      lifetime: ServiceLifetime.TRANSIENT,
+      tags: ["handler"],
+    });
+
+    const handlers = await container.resolveAll<{ t: string }>("handler");
+    expect(handlers.map((h) => h.t).sort()).toEqual(["email", "sms"]);
+
+    const io = await container.resolveAll<{ t: string }>("io");
+    expect(io).toHaveLength(1);
+
+    const none = await container.resolveAll("does-not-exist");
+    expect(none).toEqual([]);
+    await container.dispose();
+  });
+});
+
+describe("Uplift: scopeTimeout configuration is honored", () => {
+  const savedWorker = process.env.JEST_WORKER_ID;
+  const savedNodeEnv = process.env.NODE_ENV;
+
+  afterEach(() => {
+    jest.useRealTimers();
+    if (savedWorker === undefined) delete process.env.JEST_WORKER_ID;
+    else process.env.JEST_WORKER_ID = savedWorker;
+    if (savedNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = savedNodeEnv;
+  });
+
+  it("auto-disposes an idle scope after the configured scopeTimeout", async () => {
+    // Force the non-test branch so the timer actually arms; fake the clock.
+    delete process.env.JEST_WORKER_ID;
+    process.env.NODE_ENV = "development";
+    jest.useFakeTimers();
+
+    const container = new DefaultServiceContainer({ scopeTimeout: 50 });
+    container.registerScoped("s", () => ({ id: 1 }));
+    const scope = container.createScope();
+    await scope.resolve("s");
+
+    await jest.advanceTimersByTimeAsync(60);
+
+    await expect(scope.resolve("s")).rejects.toThrow(/disposed scope/);
+    expect(container.getStatistics().activeScopes).toBe(0);
+
+    jest.useRealTimers();
+    await container.dispose();
+  });
+});
