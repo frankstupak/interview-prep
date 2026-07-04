@@ -2,7 +2,11 @@
 export enum PaginationType {
   PAGE_BASED = "page_based",
   OFFSET_BASED = "offset_based",
+  CURSOR_BASED = "cursor_based",
 }
+
+/** Sort direction for cursor-based pagination */
+export type SortDirection = "asc" | "desc";
 
 // Base interface for all pagination requests
 export interface BasePaginationRequest {
@@ -22,8 +26,17 @@ export interface OffsetBasedRequest extends BasePaginationRequest {
   offset?: number; // Number of items to skip (0-based, default: 0)
 }
 
+// Cursor-based (keyset) pagination request: opaque cursor + sort spec
+export interface CursorBasedRequest extends BasePaginationRequest {
+  type: PaginationType.CURSOR_BASED;
+  cursor?: string; // Opaque token from a previous response; omit for the first page
+  sortBy?: string; // Field establishing the order (default: "id"); id is always the tiebreaker
+  sortDirection?: SortDirection; // default: "asc"
+  scope?: string; // Optional filter fingerprint baked into issued cursors; mismatched cursors are rejected
+}
+
 // Union type for all pagination requests
-export type PaginationRequest = PageBasedRequest | OffsetBasedRequest;
+export type PaginationRequest = PageBasedRequest | OffsetBasedRequest | CursorBasedRequest;
 
 /** Base for paginated items; extend with specific fields (e.g. Employee) */
 export interface DataItem {
@@ -55,8 +68,21 @@ export interface OffsetBasedResult<T = DataItem> extends BasePaginationResult<T>
   hasMore: boolean;
 }
 
+// Cursor-based pagination result
+export interface CursorBasedResult<T = DataItem> extends BasePaginationResult<T> {
+  type: PaginationType.CURSOR_BASED;
+  sortBy: string;
+  sortDirection: SortDirection;
+  nextCursor: string | null; // null = no more items after this page
+  prevCursor: string | null; // null = nothing before this page
+  hasMore: boolean; // more items exist past the end of this page
+}
+
 // Union type for all pagination results
-export type PaginationResult<T = DataItem> = PageBasedResult<T> | OffsetBasedResult<T>;
+export type PaginationResult<T = DataItem> =
+  | PageBasedResult<T>
+  | OffsetBasedResult<T>
+  | CursorBasedResult<T>;
 
 // Configuration for pagination
 export interface PaginationConfig {

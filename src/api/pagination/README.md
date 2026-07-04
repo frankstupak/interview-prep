@@ -29,21 +29,46 @@ npm run pagination:build
 - **What:** Request by `offset` and `limit`; response includes `hasMore`.
 - **Pros:** Stable performance; no total count needed; good for APIs and
   infinite scroll.
-- **Cons:** No “page number” concept; less intuitive for some UIs.
+- **Cons:** No “page number” concept; less intuitive for some UIs. Rows
+  inserted/deleted between requests shift every offset — clients see
+  duplicated or silently skipped rows.
 - **When:** Public APIs, mobile infinite scroll, data exports, large datasets.
+
+### Cursor-based (keyset)
+
+- **What:** Request by opaque `cursor` + `limit`; response includes
+  `nextCursor`, `prevCursor`, `hasMore`. The pattern used by Stripe, Slack
+  and GitHub.
+- **How:** The cursor encodes the last item's `(sortBy value, id)` tuple;
+  the next page seeks strictly past that anchor (binary search, O(log n))
+  instead of counting rows. `id` is always the tiebreaker, so non-unique
+  sort fields never skip or duplicate rows at page boundaries.
+- **Pros:** Immune to insert/delete drift — no dup/skip rows while
+  paginating live data. Cursors are scoped to their sort + filter; replaying
+  one against a different scope returns a clear 400 instead of wrong rows.
+  Works even if the anchor row was deleted.
+- **Cons:** No random page access; forward/backward only.
+- **When:** Live feeds, sync jobs, anything paginating data that changes.
+
+Benchmark (`npm run bench`, 1M rows, 100/page): binary-search seek sweeps
+all 10,000 pages in ~112ms vs ~17.9s for a naive linear-seek cursor
+implementation (~160x); a single page at 90% depth is ~430x faster.
 
 ## Endpoints
 
-| Endpoint                  | Method | Description             |
-| ------------------------- | ------ | ----------------------- |
-| `/health`                 | GET    | Health check            |
-| `/employees/page-based`   | GET    | Page-based pagination   |
-| `/employees/offset-based` | GET    | Offset-based pagination |
-| `/employees/paginate`     | GET    | Generic (type in query) |
-| `/employees/stats`        | GET    | Dataset statistics      |
+| Endpoint                  | Method | Description                |
+| ------------------------- | ------ | -------------------------- |
+| `/health`                 | GET    | Health check               |
+| `/employees/page-based`   | GET    | Page-based pagination      |
+| `/employees/offset-based` | GET    | Offset-based pagination    |
+| `/employees/cursor-based` | GET    | Cursor (keyset) pagination |
+| `/employees/paginate`     | GET    | Generic (type in query)    |
+| `/employees/stats`        | GET    | Dataset statistics         |
 
-Query params: `page`, `limit`, `offset`, `department` (filter). Config:
-`defaultLimit`, `maxLimit`.
+Query params: `page`, `limit`, `offset`, `cursor`, `sortBy`, `sortDirection`,
+`department` (filter). Config: `defaultLimit`, `maxLimit`. Numeric params are
+strictly validated — `page=5abc` or `page=1.5` return 400 instead of being
+silently coerced.
 
 ## Project structure
 

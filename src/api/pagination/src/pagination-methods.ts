@@ -10,6 +10,8 @@ import {
   DataItem,
   PaginationConfig,
 } from "./pagination-types";
+import { paginateWithCursor } from "./cursor";
+import { normalizeLimit, normalizeOffset, normalizePage } from "./normalize";
 
 /** Exhaustiveness helper: ensures all union variants are handled at compile time. */
 function assertNever(value: never): never {
@@ -36,23 +38,24 @@ function validateAndNormalizePaginationRequest(
   request: PaginationRequest,
   config: PaginationConfig = DEFAULT_CONFIG
 ): PaginationRequest {
-  // Validate and normalize limit
-  const requestLimit = request.limit !== undefined ? request.limit : config.defaultLimit;
-  const limit = Math.min(Math.max(requestLimit, 1), config.maxLimit);
+  // Validate and normalize limit. Integer-safe: fractional, NaN and
+  // non-finite inputs previously flowed straight into Array.slice and
+  // Math.ceil, silently returning wrong rows or NaN totalPages.
+  const limit = normalizeLimit(request.limit, config.defaultLimit, config.maxLimit);
 
   if (request.type === PaginationType.PAGE_BASED) {
     const pageRequest = request as PageBasedRequest;
     return {
       ...pageRequest,
       limit,
-      page: Math.max(pageRequest.page || 1, 1), // Ensure page is at least 1
+      page: normalizePage(pageRequest.page), // Integer, at least 1
     };
   } else {
     const offsetRequest = request as OffsetBasedRequest;
     return {
       ...offsetRequest,
       limit,
-      offset: Math.max(offsetRequest.offset || 0, 0), // Ensure offset is at least 0
+      offset: normalizeOffset(offsetRequest.offset), // Integer, at least 0
     };
   }
 }
@@ -160,6 +163,8 @@ export function paginate<T extends DataItem>(
       return paginateWithPageBased(data, request, config);
     case PaginationType.OFFSET_BASED:
       return paginateWithOffsetBased(data, request, config);
+    case PaginationType.CURSOR_BASED:
+      return paginateWithCursor(data, request, config);
     default:
       return assertNever(request);
   }
@@ -214,4 +219,18 @@ export function pageToOffset(page: number, limit: number): number {
  */
 export function offsetToPage(offset: number, limit: number): number {
   return Math.floor(Math.max(offset, 0) / limit) + 1;
+}
+
+/**
+ * Helper function to create a cursor-based pagination request
+ * @param options - cursor (omit for first page), limit, sortBy, sortDirection, scope
+ * @returns Cursor-based pagination request
+ */
+export function createCursorBasedRequest(
+  options: Omit<import("./pagination-types").CursorBasedRequest, "type"> = {}
+): import("./pagination-types").CursorBasedRequest {
+  return {
+    type: PaginationType.CURSOR_BASED,
+    ...options,
+  };
 }

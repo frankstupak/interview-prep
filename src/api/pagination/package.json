@@ -12,6 +12,7 @@
     "test:coverage": "jest --coverage --testTimeout=90000",
     "clean": "rm -rf ../../../dist/api/pagination",
     "lint": "eslint 'src/**/*.ts'",
+    "bench": "tsx bench/cursor-bench.ts",
     "lint:fix": "eslint 'src/**/*.ts' --fix && npm run format",
     "format": "prettier --write 'src/**/*.{ts,js,json}' '*.md'",
     "format:check": "prettier --check 'src/**/*.{ts,js,json}' '*.md'",
@@ -29,6 +30,8 @@
   "author": "Jonathan (https://github.com/SkinnnyJay)",
   "license": "MIT",
   "dependencies": {
+    "@fastify/swagger": "^9.4.0",
+    "fastify": "^5.7.4",
     "zod": "^3.23.8"
   },
   "jest": {
