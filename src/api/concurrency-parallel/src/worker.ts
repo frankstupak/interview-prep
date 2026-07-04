@@ -177,19 +177,27 @@ async function processBatch(dataArray: unknown[]): Promise<unknown[]> {
 }
 
 /**
- * Fibonacci calculation (recursive approach for demonstration)
- * CPU-intensive for large numbers
+ * Fibonacci calculation via fast doubling — O(log n) instead of the naive
+ * O(2^n) recursion. fib(45) alone took multi-second CPU time recursively;
+ * fast doubling answers any n <= 50 in microseconds and is exact well past
+ * the cap (every fib(n) for n <= 78 fits in a double-precision integer).
+ * Identities: fib(2k) = fib(k) * (2*fib(k+1) - fib(k));
+ *             fib(2k+1) = fib(k)^2 + fib(k+1)^2.
  */
 async function calculateFibonacci(n: number): Promise<{ result: number; n: number }> {
   if (n < 0) throw new Error("Fibonacci not defined for negative numbers");
   if (n > 50) throw new Error("Fibonacci calculation too large (max 50)");
 
-  function fib(num: number): number {
-    if (num <= 1) return num;
-    return fib(num - 1) + fib(num - 2);
+  function fibPair(k: number): [number, number] {
+    // Returns [fib(k), fib(k+1)]
+    if (k === 0) return [0, 1];
+    const [a, b] = fibPair(Math.floor(k / 2));
+    const c = a * (2 * b - a);
+    const d = a * a + b * b;
+    return k % 2 === 0 ? [c, d] : [d, c + d];
   }
 
-  const result = fib(n);
+  const [result] = fibPair(n);
 
   return { result, n };
 }

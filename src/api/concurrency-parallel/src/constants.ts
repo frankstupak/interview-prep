@@ -13,4 +13,10 @@ export const ParallelDefaultConfig = {
   WORKER_READY_TIMEOUT_MS: 30000,
   SHUTDOWN_WAIT_MS: 5000,
   MS_PER_SECOND: 1000,
+  MAX_WORKER_RESTARTS: 3,
+} as const;
+
+/** Default concurrency (event-loop) config values */
+export const ConcurrencyDefaultConfig = {
+  MAX_COMPLETED_TASKS: 1000,
 } as const;

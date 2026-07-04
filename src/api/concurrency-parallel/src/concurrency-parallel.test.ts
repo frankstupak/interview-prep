@@ -453,10 +453,11 @@ describe("Integration Tests", () => {
         return { taskId: task.id };
       };
 
-      // Note: The current implementation doesn't have built-in timeout handling
-      // This test documents the expected behavior for future implementation
-      const results = await manager.executeAllConcurrent(slowTasks, slowProcessor);
-      expect(results).toHaveLength(1);
+      // ConcurrencyConfig.timeout is now enforced: a task exceeding it rejects
+      // instead of hanging the batch (this test previously documented the gap).
+      await expect(manager.executeAllConcurrent(slowTasks, slowProcessor)).rejects.toThrow(
+        /timed out after 500ms/
+      );
     });
   });
 });
