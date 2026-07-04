@@ -155,6 +155,13 @@ export interface WebSocketConfig {
 }
 
 export interface WebSocketHooks {
+  /**
+   * Gate hook that runs BEFORE built-in message handling (ping, join_room,
+   * room_message, ...). Return false to drop the message entirely — this is
+   * where policies like rate limiting belong, since onMessage only runs after
+   * built-ins have already executed.
+   */
+  onBeforeMessage?: (client: WebSocketClient, message: AnyMessage) => boolean | Promise<boolean>;
   onConnect?: (client: WebSocketClient) => void | Promise<void>;
   onDisconnect?: (client: WebSocketClient) => void | Promise<void>;
   onMessage?: (client: WebSocketClient, message: AnyMessage) => void | Promise<void>;

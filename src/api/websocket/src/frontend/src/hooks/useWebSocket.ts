@@ -83,12 +83,39 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
   // Handle incoming messages
   const handleMessage = useCallback(
     (message: WebSocketMessage) => {
-      setLastMessage(message);
-      setMessageHistory((prev) => [...prev.slice(-99), message]); // Keep last 100 messages
+      const isHeartbeat = message.type === "ping" || message.type === "pong";
+      // Keep heartbeat traffic out of lastMessage/history — at a 30s server
+      // ping interval the 100-slot history would otherwise fill with noise.
+      if (!isHeartbeat) {
+        setLastMessage(message);
+        setMessageHistory((prev) => [...prev.slice(-99), message]); // Keep last 100 messages
+      }
       onMessage?.(message);
 
       // Handle built-in message types (narrow with assertion; GenericWebSocketMessage.type is string so TS doesn't narrow)
       switch (message.type) {
+        case "ping": {
+          // Answer the server's application-level heartbeat. Browsers answer
+          // protocol-level pings automatically, but JS never sees those — the
+          // JSON heartbeat is the only one we can (and must) answer ourselves.
+          // Echo the server's payload so it can compute round-trip time.
+          const pong = {
+            id: crypto.randomUUID(),
+            type: "pong",
+            payload: message.payload ?? { timestamp: Date.now() },
+            timestamp: Date.now(),
+          };
+          try {
+            if (socketIORef.current) {
+              socketIORef.current.emit("pong", pong);
+            } else if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+              wsRef.current.send(JSON.stringify(pong));
+            }
+          } catch {
+            // Connection racing shut; the next reconnect cycle handles it.
+          }
+          break;
+        }
         case "connect": {
           const p = (message as ConnectMessage).payload;
           setConnectionStatus((prev) => ({
@@ -270,19 +297,28 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
     setConnectionStatus((prev) => ({ ...prev, connected: false, connecting: false }));
   }, []);
 
-  // Schedule reconnect
+  // Schedule reconnect with exponential backoff + jitter. Fixed intervals mean
+  // every client dropped by a server restart retries in synchronized waves
+  // (thundering herd); jitter spreads the retries, the exponential curve backs
+  // off a dead server, and the 30s cap keeps recovery latency bounded.
   const scheduleReconnect = useCallback((): void => {
     if (reconnectTimeoutRef.current) return;
 
     reconnectAttemptsRef.current++;
+    const exponential = Math.min(
+      reconnectInterval * 2 ** (reconnectAttemptsRef.current - 1),
+      30000
+    );
+    // Randomize between 50% and 100% of the computed delay.
+    const delay = exponential / 2 + Math.random() * (exponential / 2);
     console.warn(
-      `Scheduling reconnect attempt ${reconnectAttemptsRef.current}/${maxReconnectAttempts}`
+      `Scheduling reconnect attempt ${reconnectAttemptsRef.current}/${maxReconnectAttempts} in ${Math.round(delay)}ms`
     );
 
     reconnectTimeoutRef.current = setTimeout(() => {
       reconnectTimeoutRef.current = null;
       connect();
-    }, reconnectInterval);
+    }, delay);
   }, [connect, reconnectInterval, maxReconnectAttempts]);
 
   // Send message function

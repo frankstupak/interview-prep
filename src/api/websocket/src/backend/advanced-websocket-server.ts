@@ -21,6 +21,8 @@ interface AdvancedWebSocketConfig extends WebSocketConfig {
   rateLimitWindow: number;
   enableAuth: boolean;
   authTokenHeader: string;
+  /** Tokens accepted when enableAuth is true (compared in constant time). */
+  authTokens: string[];
   enableMessageHistory: boolean;
   maxHistorySize: number;
   enablePresence: boolean;
@@ -44,6 +46,9 @@ export class AdvancedWebSocketServer implements WebSocketServer {
   private rateLimitMap = new Map<string, RateLimitEntry>();
   private messageHistory = new Map<string, MessageHistory>();
   private presenceMap = new Map<string, Record<string, unknown>>();
+  // Messages already counted by the onBeforeMessage rate-limit gate (WeakSet:
+  // entries vanish with the message object, no cleanup needed).
+  private rateLimitCounted = new WeakSet<object>();
   private cleanupIntervalId: NodeJS.Timeout | null = null; // Store interval ID for cleanup
 
   constructor(config: Partial<AdvancedWebSocketConfig> = {}, hooks?: WebSocketHooks) {
@@ -61,6 +66,7 @@ export class AdvancedWebSocketServer implements WebSocketServer {
       rateLimitWindow: 60000, // 1 minute
       enableAuth: false,
       authTokenHeader: "authorization",
+      authTokens: ["valid-token"],
       enableMessageHistory: true,
       maxHistorySize: 100,
       enablePresence: true,
@@ -75,6 +81,28 @@ export class AdvancedWebSocketServer implements WebSocketServer {
     // Enhanced hooks with additional functionality
     const enhancedHooks: WebSocketHooks = {
       ...hooks,
+      onBeforeMessage: async (client, message) => {
+        // Rate limiting must gate BUILT-IN handlers too: with the old
+        // onMessage-only check, a rate-limited client could still flood rooms
+        // via room_message, because built-ins run before onMessage.
+        if (this.config.enableRateLimit) {
+          if (!this.checkRateLimit(client.id)) {
+            this.sendToClient(client.id, {
+              id: crypto.randomUUID(),
+              type: "error",
+              payload: { error: "Rate limit exceeded", code: "RATE_LIMIT" },
+              timestamp: Date.now(),
+            });
+            return false;
+          }
+          // Mark as already counted so the onMessage hook doesn't double-count.
+          this.rateLimitCounted.add(message as object);
+        }
+        if (hooks?.onBeforeMessage) {
+          return hooks.onBeforeMessage(client, message);
+        }
+        return true;
+      },
       onConnect: async (client) => {
         if (this.config.enablePresence) {
           await this.updatePresence(client.id, { status: "online", lastSeen: Date.now() });
@@ -88,16 +116,21 @@ export class AdvancedWebSocketServer implements WebSocketServer {
         if (hooks?.onDisconnect) await hooks.onDisconnect(client);
       },
       onMessage: async (client, message) => {
-        // Rate limiting
-        if (this.config.enableRateLimit && !this.checkRateLimit(client.id)) {
-          this.sendToClient(client.id, {
-            id: crypto.randomUUID(),
-            type: "error",
-            payload: { error: "Rate limit exceeded", code: "RATE_LIMIT" },
-            timestamp: Date.now(),
-          });
-          return;
+        // Rate limiting (legacy path — only counts messages that did NOT pass
+        // through onBeforeMessage, e.g. direct hook invocation; normal traffic
+        // is already counted by the gate above).
+        if (this.config.enableRateLimit && !this.rateLimitCounted.has(message as object)) {
+          if (!this.checkRateLimit(client.id)) {
+            this.sendToClient(client.id, {
+              id: crypto.randomUUID(),
+              type: "error",
+              payload: { error: "Rate limit exceeded", code: "RATE_LIMIT" },
+              timestamp: Date.now(),
+            });
+            return;
+          }
         }
+        this.rateLimitCounted.delete(message as object);
 
         // Message history
         if (this.config.enableMessageHistory) {
@@ -193,7 +226,13 @@ export class AdvancedWebSocketServer implements WebSocketServer {
         return reply.code(HttpStatus.NOT_FOUND).send({ error: "Message history not enabled" });
       }
 
-      const { room = "global", limit = 50, offset = 0 } = request.query;
+      // Coerce query params: over HTTP they arrive as STRINGS, and the old
+      // `offset ? -offset : undefined` treated "0" as truthy — so
+      // GET /api/history?offset=0 sliced to (-limit, -0) === (-limit, 0) and
+      // always returned an empty page.
+      const { room = "global" } = request.query;
+      const limit = Math.max(0, Number(request.query.limit ?? 50) || 0);
+      const offset = Math.max(0, Number(request.query.offset ?? 0) || 0);
       const history = this.messageHistory.get(room);
 
       if (!history) {
@@ -201,7 +240,7 @@ export class AdvancedWebSocketServer implements WebSocketServer {
       }
 
       const messages = history.messages
-        .slice(-limit - offset, offset ? -offset : undefined)
+        .slice(offset > 0 ? -(limit + offset) : -limit, offset > 0 ? -offset : undefined)
         .reverse();
 
       return {
@@ -434,8 +473,20 @@ export class AdvancedWebSocketServer implements WebSocketServer {
    * Validate authentication token (placeholder implementation)
    */
   private validateToken(token: string): boolean {
-    // Placeholder implementation - replace with real authentication
-    return token === "valid-token" || token.startsWith("Bearer ");
+    // The old check accepted ANY string starting with "Bearer " — i.e.
+    // `Authorization: Bearer anything-at-all` bypassed auth entirely.
+    // Compare the presented token against configured tokens in constant time
+    // (length check first: timingSafeEqual requires equal-length buffers, and
+    // length is not a secret here).
+    const presented = token.startsWith("Bearer ") ? token.slice("Bearer ".length) : token;
+    const presentedBuffer = Buffer.from(presented);
+    return this.config.authTokens.some((expected) => {
+      const expectedBuffer = Buffer.from(expected);
+      return (
+        expectedBuffer.length === presentedBuffer.length &&
+        crypto.timingSafeEqual(expectedBuffer, presentedBuffer)
+      );
+    });
   }
 
   /**
@@ -487,14 +538,17 @@ export class AdvancedWebSocketServer implements WebSocketServer {
   }
 
   async stop(): Promise<void> {
+    // Clear the cleanup interval even if the server never started listening —
+    // the interval is created in the constructor, so the old early-return
+    // leaked a live timer for constructed-but-never-started servers.
+    if (this.cleanupIntervalId) {
+      clearInterval(this.cleanupIntervalId);
+      this.cleanupIntervalId = null;
+    }
+
     if (!this.isRunning) return;
 
     try {
-      if (this.cleanupIntervalId) {
-        clearInterval(this.cleanupIntervalId);
-        this.cleanupIntervalId = null;
-      }
-
       this.manager.destroy();
       await this.app.close();
       this.isRunning = false;
@@ -526,12 +580,20 @@ export class AdvancedWebSocketServer implements WebSocketServer {
   }
 
   addClientToRoom(clientId: string, room: string): boolean {
-    this.manager.addClientToRoom(clientId, room);
+    // Honest return: previously this returned true even for unknown clients.
+    // (hasClient guard is feature-detected so mocked managers keep working.)
+    if (typeof this.manager.hasClient === "function" && !this.manager.hasClient(clientId)) {
+      return false;
+    }
+    void this.manager.addClientToRoom(clientId, room);
     return true;
   }
 
   removeClientFromRoom(clientId: string, room: string): boolean {
-    this.manager.removeClientFromRoom(clientId, room);
+    if (typeof this.manager.hasClient === "function" && !this.manager.hasClient(clientId)) {
+      return false;
+    }
+    void this.manager.removeClientFromRoom(clientId, room);
     return true;
   }
 }

@@ -275,7 +275,11 @@ export class BasicWebSocketServer implements WebSocketServer {
    * Add client to room
    */
   addClientToRoom(clientId: string, room: string): boolean {
-    // Fire and forget - manager methods are async but interface is sync
+    // Fire and forget - manager methods are async but interface is sync.
+    // Honest return: false for clients the manager doesn't know about.
+    if (typeof this.manager.hasClient === "function" && !this.manager.hasClient(clientId)) {
+      return false;
+    }
     void this.manager.addClientToRoom(clientId, room);
     return true;
   }
@@ -284,7 +288,9 @@ export class BasicWebSocketServer implements WebSocketServer {
    * Remove client from room
    */
   removeClientFromRoom(clientId: string, room: string): boolean {
-    // Fire and forget - manager methods are async but interface is sync
+    if (typeof this.manager.hasClient === "function" && !this.manager.hasClient(clientId)) {
+      return false;
+    }
     void this.manager.removeClientFromRoom(clientId, room);
     return true;
   }
