@@ -27,13 +27,13 @@ export class PhoneticMatcher {
    * 5. Pad with zeros or truncate to 4 characters
    */
   static soundex(str: string): string {
-    if (!str || str.length === 0) return "0000";
+    // Keep only letters; the first letter drives the output character.
+    const word = str.toUpperCase().replace(/[^A-Z]/g, "");
+    if (word.length === 0) return "0000";
 
-    // Convert to uppercase and get first letter
-    const word = str.toUpperCase();
     let soundexCode = word[0];
 
-    // Soundex mapping
+    // Soundex digit mapping (vowels, H, W, Y intentionally absent).
     const soundexMap: { [key: string]: string } = {
       B: "1",
       F: "1",
@@ -55,21 +55,32 @@ export class PhoneticMatcher {
       R: "6",
     };
 
-    // Process remaining characters
+    // `prevCode` seeds from the FIRST letter so a same-coded second letter
+    // is collapsed with it (e.g. "Pfister" -> P/F both map to 1 -> "P236").
+    let prevCode = soundexMap[word[0]] || "";
+
+    // H and W are transparent: two same-coded consonants separated by H/W are
+    // coded once ("Ashcraft" -> A261). A VOWEL (or Y) is a true separator: it
+    // resets `prevCode` so a repeat digit is coded again ("Tymczak" -> T522,
+    // "Honeyman" -> H555).
     for (let i = 1; i < word.length && soundexCode.length < 4; i++) {
       const char = word[i];
       const code = soundexMap[char];
 
       if (code) {
-        // Don't add duplicate codes
-        if (soundexCode[soundexCode.length - 1] !== code) {
+        if (code !== prevCode) {
           soundexCode += code;
         }
+        prevCode = code;
+      } else if (char === "H" || char === "W") {
+        // Transparent — leave prevCode untouched so H/W bridges same codes.
+      } else {
+        // Vowel or Y: acts as a separator, allowing the next repeat to code.
+        prevCode = "";
       }
-      // Skip vowels (A, E, I, O, U) and H, W, Y
     }
 
-    // Pad with zeros or truncate to 4 characters
+    // Pad with zeros or truncate to 4 characters.
     return (soundexCode + "0000").substring(0, 4);
   }
 
