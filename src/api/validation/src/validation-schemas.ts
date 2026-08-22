@@ -3,6 +3,77 @@ import { z } from "zod";
 import { CommonValidations, FieldLimits } from "./validation-types";
 
 /**
+ * SSRF guard for server-fetched URLs (webhooks).
+ * Rejects loopback, private (RFC1918), link-local / cloud-metadata,
+ * carrier-grade NAT, unspecified, and their common IPv6 equivalents,
+ * plus localhost-style hostnames. Exported for testing.
+ */
+export function isInternalWebhookTarget(rawUrl: string): boolean {
+  let hostname: string;
+  try {
+    hostname = new URL(rawUrl).hostname.toLowerCase();
+  } catch {
+    return true; // unparseable → treat as unsafe
+  }
+
+  // Hostname classes
+  if (hostname === "localhost" || hostname.endsWith(".localhost") || hostname.endsWith(".local")) {
+    return true;
+  }
+
+  // IPv6 literals arrive from URL.hostname wrapped in brackets — strip them.
+  const bare = hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : hostname;
+  if (bare.includes(":")) {
+    // IPv6: loopback, unspecified, link-local fe80::/10, unique-local fc00::/7,
+    // and IPv4-mapped (delegate to the v4 check).
+    if (bare === "::1" || bare === "::") return true;
+    if (/^fe[89ab]/i.test(bare)) return true;
+    if (/^f[cd]/i.test(bare)) return true;
+    const mapped = bare.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
+    if (mapped) return isInternalIPv4(mapped[1]);
+    return false;
+  }
+
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(bare)) {
+    return isInternalIPv4(bare);
+  }
+
+  return false;
+}
+
+function isInternalIPv4(ip: string): boolean {
+  const parts = ip.split(".").map(Number);
+  if (parts.length !== 4 || parts.some((p) => Number.isNaN(p) || p > 255)) {
+    return true; // malformed → unsafe
+  }
+  const [a, b] = parts;
+  return (
+    a === 0 || // 0.0.0.0/8 unspecified
+    a === 10 || // 10.0.0.0/8 private
+    a === 127 || // 127.0.0.0/8 loopback
+    (a === 100 && b >= 64 && b <= 127) || // 100.64.0.0/10 CGNAT
+    (a === 169 && b === 254) || // 169.254.0.0/16 link-local / cloud metadata
+    (a === 172 && b >= 16 && b <= 31) || // 172.16.0.0/12 private
+    (a === 192 && b === 168) // 192.168.0.0/16 private
+  );
+}
+
+/**
+ * Calendar-accurate age in whole years.
+ * Replaces the previous `elapsedMs / (365.25 * 24h)` approximation, which is
+ * off by up to a day around birthdays (someone turning 13 today could be
+ * rejected, someone turning 13 tomorrow could be accepted).
+ */
+export function calendarAgeInYears(dateOfBirth: Date, now: Date = new Date()): number {
+  let age = now.getUTCFullYear() - dateOfBirth.getUTCFullYear();
+  const monthDiff = now.getUTCMonth() - dateOfBirth.getUTCMonth();
+  if (monthDiff < 0 || (monthDiff === 0 && now.getUTCDate() < dateOfBirth.getUTCDate())) {
+    age--;
+  }
+  return age;
+}
+
+/**
  * User-related validation schemas
  * Comprehensive schemas for user management operations
  */
@@ -33,17 +104,14 @@ export const UserSchemas = {
         )
         .trim(),
       dateOfBirth: z
-        .string()
-        .datetime("Invalid date format")
+        .union([z.string().date(), z.string().datetime()], {
+          errorMap: () => ({
+            message: "Invalid date format (expected YYYY-MM-DD or ISO 8601 datetime)",
+          }),
+        })
         .transform((str) => new Date(str))
-        .refine((date) => {
-          const age = (Date.now() - date.getTime()) / (365.25 * 24 * 60 * 60 * 1000);
-          return age >= 13;
-        }, "Must be at least 13 years old")
-        .refine((date) => {
-          const age = (Date.now() - date.getTime()) / (365.25 * 24 * 60 * 60 * 1000);
-          return age <= 120;
-        }, "Invalid date of birth"),
+        .refine((date) => calendarAgeInYears(date) >= 13, "Must be at least 13 years old")
+        .refine((date) => calendarAgeInYears(date) <= 120, "Invalid date of birth"),
       phone: CommonValidations.phone.optional(),
       acceptTerms: z.boolean().refine((val) => val === true, "Must accept terms and conditions"),
       marketingOptIn: z.boolean().default(false),
@@ -95,9 +163,21 @@ export const UserSchemas = {
         .max(FieldLimits.MEDIUM, "Location must not exceed 100 characters")
         .trim()
         .optional(),
+      // Validate against the runtime's actual IANA timezone database instead
+      // of a shape regex. The old pattern (^[A-Za-z_]+/[A-Za-z_]+$) rejected
+      // large parts of the real tz database: three-segment zones
+      // ("America/Argentina/Buenos_Aires"), single-token zones ("UTC"), and
+      // offset zones ("Etc/GMT+8") — while accepting nonsense like "Foo/Bar".
       timezone: z
         .string()
-        .regex(/^[A-Za-z_]+\/[A-Za-z_]+$/, "Invalid timezone format")
+        .refine((tz) => {
+          try {
+            new Intl.DateTimeFormat("en-US", { timeZone: tz });
+            return true;
+          } catch {
+            return false;
+          }
+        }, "Invalid IANA timezone")
         .optional(),
       preferences: z
         .object({
@@ -227,7 +307,11 @@ export const ProductSchemas = {
     })
     .refine(
       (data) => {
-        if (data.priceMin && data.priceMax) {
+        // != null (not truthiness): prices are in cents and 0 is a legal
+        // value. The old `if (data.priceMin && data.priceMax)` skipped the
+        // check whenever either bound was 0, so priceMin=500, priceMax=0
+        // sailed through validation with an impossible range.
+        if (data.priceMin != null && data.priceMax != null) {
           return data.priceMin <= data.priceMax;
         }
         return true;
@@ -444,6 +528,15 @@ export const ApiSchemas = {
       .regex(
         /^[\u0020-\u0021\u0023-\u0029\u002B-\u002E\u0030-\u0039\u003B-\u003D\u0040-\u005B\u005D-\u007B\u007D-\u007E]+$/,
         "Invalid filename characters"
+      )
+      // The character allowlist alone still admitted "." and ".."
+      // (directory-traversal primitives if the name ever reaches a
+      // filesystem path join) plus Windows-hostile leading/trailing
+      // spaces and trailing dots.
+      .refine((name) => name !== "." && name !== "..", "Invalid filename")
+      .refine(
+        (name) => name === name.trim() && !name.endsWith("."),
+        "Filename cannot have leading/trailing spaces or a trailing dot"
       ),
     mimeType: z.string().regex(/^[a-z]+\/[a-z0-9+.-]+$/i, "Invalid MIME type format"),
     size: z
@@ -467,9 +560,18 @@ export const ApiSchemas = {
   // Webhook configuration schema
   // Why: Validates webhook endpoints and security settings
   webhook: z.object({
-    url: CommonValidations.url.refine((url) => url.startsWith("https://"), {
-      message: "Webhook URL must use HTTPS",
-    }),
+    // SSRF guard: user-supplied webhook URLs are fetched by OUR servers, so
+    // internal targets must be rejected — loopback, RFC1918 private ranges,
+    // link-local (incl. 169.254.169.254 cloud metadata), and their IPv6
+    // equivalents. Hostname-based DNS rebinding still needs a resolve-time
+    // check in the HTTP client; this blocks the literal-address class.
+    url: CommonValidations.url
+      .refine((url) => url.startsWith("https://"), {
+        message: "Webhook URL must use HTTPS",
+      })
+      .refine((url) => !isInternalWebhookTarget(url), {
+        message: "Webhook URL must not target internal or private addresses",
+      }),
     events: z
       .array(z.string().min(1).max(100))
       .min(1, "At least one event must be selected")

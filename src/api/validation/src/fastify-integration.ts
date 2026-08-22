@@ -323,7 +323,7 @@ async function fastifyValidationPlugin(
    */
   fastify.decorate("validate", async function <
     T,
-  >(schema: z.ZodSchema<T>, data: unknown, validationOptions?: ValidationOptions, context?: ValidationContext): Promise<
+  >(schema: z.ZodType<T, z.ZodTypeDef, unknown>, data: unknown, validationOptions?: ValidationOptions, context?: ValidationContext): Promise<
     ValidationOutcome<T>
   > {
     return engine.validate(schema, data, validationOptions, context);
@@ -516,8 +516,15 @@ export const ValidationMiddleware = {
   requireContentType: (
     contentType: string
   ): ((request: FastifyRequest, reply: FastifyReply, done: (err?: Error) => void) => void) => {
+    const expected = contentType.toLowerCase();
     return (request: FastifyRequest, reply: FastifyReply, done: (err?: Error) => void): void => {
-      if (!request.headers["content-type"]?.includes(contentType)) {
+      // Compare the media type exactly (parameters like charset stripped).
+      // The previous substring check (`includes`) accepted supersets such as
+      // "application/jsonx" or "text/application/json-ish" for
+      // "application/json".
+      const header = request.headers["content-type"];
+      const mediaType = header?.split(";")[0]?.trim().toLowerCase();
+      if (mediaType !== expected) {
         reply.code(HttpStatus.UNSUPPORTED_MEDIA_TYPE).send({
           error: "unsupported_media_type",
           message: `Expected content type: ${contentType}`,
@@ -548,7 +555,7 @@ declare module "fastify" {
       ) => Promise<unknown>;
     };
     validate<T>(
-      schema: z.ZodSchema<T>,
+      schema: z.ZodType<T, z.ZodTypeDef, unknown>,
       data: unknown,
       options?: ValidationOptions,
       context?: ValidationContext

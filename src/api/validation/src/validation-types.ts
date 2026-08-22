@@ -149,14 +149,19 @@ export const FieldLimits = {
  * Reusable validation schemas for common data types
  */
 export const CommonValidations = {
-  // Email validation with comprehensive pattern
+  // Email validation with comprehensive pattern.
+  // NOTE: .trim()/.toLowerCase() must run BEFORE .email() and the length
+  // checks. Zod applies string checks/transforms strictly in chain order, so
+  // the previous ordering (email → ... → toLowerCase → trim) rejected inputs
+  // like "  User@Example.com  " that the trailing normalizers were clearly
+  // meant to accept.
   email: z
     .string()
+    .trim()
+    .toLowerCase()
     .email("Invalid email format")
     .min(5, "Email must be at least 5 characters")
-    .max(FieldLimits.EMAIL, "Email must not exceed 254 characters")
-    .toLowerCase()
-    .trim(),
+    .max(FieldLimits.EMAIL, "Email must not exceed 254 characters"),
 
   // Password validation with security requirements
   password: z

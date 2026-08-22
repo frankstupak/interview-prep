@@ -577,3 +577,271 @@ describe("Validation middleware", () => {
     expect(next).toHaveBeenCalled();
   });
 });
+
+
+describe("Uplift regressions — engine option semantics", () => {
+  let engine: ValidationEngine;
+
+  beforeEach(() => {
+    engine = new ValidationEngine({ logValidationErrors: false });
+  });
+
+  it("honors allowUnknown passed alone (previously silently ignored)", async () => {
+    const schema = z.object({ a: z.string() });
+    const result = await engine.validate(schema, { a: "x", b: "y" }, { allowUnknown: true });
+
+    expect(result.success).toBe(true);
+    expect(result.success && result.data).toEqual({ a: "x", b: "y" });
+  });
+
+  it("applies strict mode to ZodEffects schemas (refine-wrapped objects)", async () => {
+    const schema = z.object({ a: z.string() }).refine(() => true);
+    const result = await engine.validate(
+      schema,
+      { a: "x", b: "y" },
+      { stripUnknown: false, allowUnknown: false }
+    );
+
+    expect(result.success).toBe(false);
+  });
+
+  it("strips unknown keys through ZodEffects schemas and reports warnings", async () => {
+    const result = await engine.validate(UserSchemas.registration, {
+      email: "user@example.com",
+      password: "Str0ng!Pass",
+      confirmPassword: "Str0ng!Pass",
+      firstName: "Ada",
+      lastName: "Lovelace",
+      dateOfBirth: "1990-05-10",
+      acceptTerms: true,
+      injected: "field",
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.success && result.warnings).toEqual(["Stripped unknown fields: injected"]);
+  });
+
+  it("does not downgrade a schema's own .strict() under engine defaults", async () => {
+    // profileUpdate is declared .strict() ("Prevent unknown fields"); the old
+    // engine replaced it with .strip() and silently accepted unknown keys.
+    const result = await engine.validate(UserSchemas.profileUpdate, {
+      firstName: "Ada",
+      hacker: "field",
+    });
+
+    expect(result.success).toBe(false);
+  });
+
+  it("allows an explicit caller option to override a .strict() schema", async () => {
+    const result = await engine.validate(
+      UserSchemas.profileUpdate,
+      { firstName: "Ada", hacker: "field" },
+      { stripUnknown: true }
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.success && (result.data as Record<string, unknown>).hacker).toBeUndefined();
+  });
+
+  it("abortEarly reports exactly the first issue", async () => {
+    const schema = z.object({ a: z.string(), b: z.number(), c: z.boolean() });
+    const bad = { a: 1, b: "x", c: 3 };
+
+    const early = await engine.validate(schema, bad, { abortEarly: true });
+    const full = await engine.validate(schema, bad, { abortEarly: false });
+
+    expect(early.success).toBe(false);
+    expect(full.success).toBe(false);
+    if (!early.success && !full.success) {
+      expect(early.error.details).toHaveLength(1);
+      expect(full.error.details).toHaveLength(3);
+      expect(early.error.details[0].field).toBe(full.error.details[0].field);
+    }
+  });
+
+  it("does not leave an unhandled rejection when an async refinement fails after timeout", async () => {
+    const rejections: unknown[] = [];
+    const onRejection = (reason: unknown): void => {
+      rejections.push(reason);
+    };
+    process.on("unhandledRejection", onRejection);
+
+    try {
+      const slow = new ValidationEngine({ maxValidationTime: 5, logValidationErrors: false });
+      const schema = z.string().refine(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        throw new Error("late failure");
+      });
+
+      const result = await slow.validate(schema, "x");
+      expect(result.success).toBe(false);
+
+      // Give the losing promise time to reject.
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      expect(rejections).toHaveLength(0);
+    } finally {
+      process.off("unhandledRejection", onRejection);
+    }
+  });
+
+  it("keeps context flowing through the validateData convenience wrapper", async () => {
+    const result = await validateData(
+      z.object({ a: z.string() }),
+      { a: 1 },
+      { errorFormat: "detailed" },
+      { requestId: "req-123" }
+    );
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.path).toBe("req-123");
+    }
+  });
+
+  it("validateBatch with concurrency preserves index order and overlaps async work", async () => {
+    const DELAY_MS = 10;
+    const ITEMS = 24;
+    const schema = z
+      .object({ value: z.number() })
+      .refine(async (payload) => {
+        await new Promise((resolve) => setTimeout(resolve, DELAY_MS));
+        return payload.value >= 0;
+      }, "must be non-negative");
+
+    const payload = Array.from({ length: ITEMS }, (_, i) => ({
+      value: i === 7 ? -1 : i,
+    }));
+
+    const t0 = performance.now();
+    const sequential = await engine.validateBatch(schema, payload);
+    const tSeq = performance.now() - t0;
+
+    const t1 = performance.now();
+    const concurrent = await engine.validateBatch(schema, payload, undefined, undefined, {
+      concurrency: 8,
+    });
+    const tConc = performance.now() - t1;
+
+    // Identical outcomes, index-stable errors.
+    expect(concurrent.summary).toEqual(sequential.summary);
+    expect(concurrent.summary.failed).toBe(1);
+    expect(concurrent.summary.errors[0].field).toBe("[7].root");
+    expect(concurrent.results).toHaveLength(ITEMS);
+    concurrent.results.forEach((r, i) => expect(r.success).toBe(i !== 7));
+
+    // Overlapped I/O must be meaningfully faster than serialized I/O.
+    // Sequential floor is ITEMS * DELAY_MS (~240ms); concurrency 8 needs ~3
+    // waves (~30ms). Assert a loose 2x to stay CI-flake-proof.
+    expect(tConc).toBeLessThan(tSeq / 2);
+  });
+});
+
+describe("Uplift regressions — schema fixes", () => {
+  it("accepts padded/mixed-case emails and normalizes them (trim before checks)", () => {
+    const result = CommonValidations.email.safeParse("  User@Example.COM  ");
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data).toBe("user@example.com");
+    }
+  });
+
+  it("rejects priceMin > priceMax even when priceMax is 0", async () => {
+    const result = await ProductSchemas.search.safeParseAsync({ priceMin: 500, priceMax: 0 });
+    expect(result.success).toBe(false);
+
+    const ok = await ProductSchemas.search.safeParseAsync({ priceMin: 0, priceMax: 500 });
+    expect(ok.success).toBe(true);
+  });
+
+  it("accepts real IANA timezones and rejects junk", () => {
+    const parse = (timezone: string): boolean =>
+      UserSchemas.profileUpdate.safeParse({ timezone }).success;
+
+    expect(parse("America/Argentina/Buenos_Aires")).toBe(true);
+    expect(parse("UTC")).toBe(true);
+    expect(parse("Etc/GMT+8")).toBe(true);
+    expect(parse("America/New_York")).toBe(true);
+    expect(parse("Not/AZone")).toBe(false);
+  });
+
+  it("rejects traversal and Windows-hostile filenames in fileUpload", () => {
+    const parse = (filename: string): boolean =>
+      ApiSchemas.fileUpload.safeParse({ filename, mimeType: "image/png", size: 10 }).success;
+
+    expect(parse("..")).toBe(false);
+    expect(parse(".")).toBe(false);
+    expect(parse("evil.exe ")).toBe(false);
+    expect(parse(" evil.exe")).toBe(false);
+    expect(parse("evil.exe.")).toBe(false);
+    expect(parse("report-2026_final.pdf")).toBe(true);
+  });
+
+  it("rejects internal/private webhook targets (SSRF guard)", () => {
+    const parse = (url: string): boolean =>
+      ApiSchemas.webhook.safeParse({ url, events: ["order.created"] }).success;
+
+    expect(parse("https://localhost/hook")).toBe(false);
+    expect(parse("https://api.localhost/hook")).toBe(false);
+    expect(parse("https://169.254.169.254/latest/meta-data")).toBe(false);
+    expect(parse("https://10.0.0.5/hook")).toBe(false);
+    expect(parse("https://172.16.0.1/hook")).toBe(false);
+    expect(parse("https://192.168.8.1/hook")).toBe(false);
+    expect(parse("https://[::1]/hook")).toBe(false);
+    expect(parse("https://hooks.example.com/order")).toBe(true);
+  });
+
+  it("accepts date-only dateOfBirth and computes calendar-accurate age", async () => {
+    const dateOnly = await UserSchemas.registration.safeParseAsync({
+      email: "user@example.com",
+      password: "Str0ng!Pass",
+      confirmPassword: "Str0ng!Pass",
+      firstName: "Ada",
+      lastName: "Lovelace",
+      dateOfBirth: "1990-05-10",
+      acceptTerms: true,
+    });
+    expect(dateOnly.success).toBe(true);
+
+    // Someone whose 13th birthday is TODAY must be accepted; the old
+    // 365.25-day approximation drifted around birthdays.
+    const now = new Date();
+    const thirteenToday = new Date(Date.UTC(now.getUTCFullYear() - 13, now.getUTCMonth(), now.getUTCDate()));
+    const boundary = await UserSchemas.registration.safeParseAsync({
+      email: "user@example.com",
+      password: "Str0ng!Pass",
+      confirmPassword: "Str0ng!Pass",
+      firstName: "Ada",
+      lastName: "Lovelace",
+      dateOfBirth: thirteenToday.toISOString().slice(0, 10),
+      acceptTerms: true,
+    });
+    expect(boundary.success).toBe(true);
+  });
+
+  it("requireContentType matches the media type exactly, not as a substring", () => {
+    const middleware = ValidationMiddleware.requireContentType("application/json");
+    const reply = {
+      code: jest.fn().mockReturnThis(),
+      send: jest.fn(),
+    } as unknown as Parameters<ReturnType<typeof ValidationMiddleware.requireContentType>>[1];
+    const next = jest.fn();
+
+    middleware(
+      { headers: { "content-type": "application/jsonx" } } as import("fastify").FastifyRequest,
+      reply,
+      next
+    );
+    expect(reply.code).toHaveBeenCalledWith(415);
+    expect(next).not.toHaveBeenCalled();
+
+    middleware(
+      {
+        headers: { "content-type": "Application/JSON; charset=utf-8" },
+      } as import("fastify").FastifyRequest,
+      reply,
+      next
+    );
+    expect(next).toHaveBeenCalledTimes(1);
+  });
+});
