@@ -24,6 +24,16 @@ npm run concurrency-parallel:test
 limited concurrency for rate limits and connection pools; priority queue when
 tasks have different importance.
 
+## Reliability & scheduling
+
+- **Worker pool is pull-based**: tasks wait in one shared queue; the next idle
+  worker takes the next task (no head-of-line blocking behind a slow task).
+  Optional `maxPendingTasks` applies backpressure; crashed workers fail their
+  in-flight task loudly and are auto-respawned (`maxWorkerRestarts`).
+- **ConcurrencyManager honors `timeout` and `retries`** from its config, plus
+  optional `signal` (AbortSignal) for cooperative cancellation and
+  `executeAllSettled()` for per-task outcomes without fail-fast.
+
 ## Endpoints
 
 - **Concurrency:** `POST /concurrent/all`, `/concurrent/limited`,

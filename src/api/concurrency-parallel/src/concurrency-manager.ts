@@ -5,8 +5,9 @@
  * 1. Promise-based concurrency control
  * 2. Queue management with priority
  * 3. Rate limiting and throttling
- * 4. Error handling and retries
- * 5. Performance monitoring
+ * 4. Error handling, retries, and per-task timeouts
+ * 5. Cooperative cancellation (AbortSignal) and fail-fast semantics
+ * 6. Performance monitoring
  */
 
 import {
@@ -14,7 +15,9 @@ import {
   ConcurrencyConfig,
   PerformanceMetrics,
   TaskProcessor,
+  SettledTaskResult,
 } from "./concurrency-types.js";
+import { ConcurrencyDefaultConfig } from "./constants";
 
 export class ConcurrencyManager {
   private config: ConcurrencyConfig;
@@ -27,6 +30,68 @@ export class ConcurrencyManager {
   }
 
   /**
+   * Run a processor for one task with the configured timeout + retries applied.
+   * - `timeout` (ms): each attempt races a timer; a late attempt rejects with a
+   *   descriptive error instead of hanging the whole batch.
+   * - `retries`: failed attempts (including timeouts) are retried up to N extra
+   *   times before the error propagates.
+   * Both settings were always declared on ConcurrencyConfig but previously ignored.
+   */
+  private async runWithPolicy<T, R>(task: T, processor: TaskProcessor<T, R>): Promise<R> {
+    const { timeout, retries = 0 } = this.config;
+    const attempts = Math.max(0, retries) + 1;
+    let lastError: unknown;
+
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        if (timeout === undefined || timeout <= 0) {
+          return await processor(task);
+        }
+        return await this.withTimeout(processor(task), timeout, attempt);
+      } catch (error) {
+        lastError = error;
+        if (attempt === attempts) break;
+      }
+    }
+    throw lastError;
+  }
+
+  private withTimeout<R>(promise: Promise<R>, timeoutMs: number, attempt: number): Promise<R> {
+    return new Promise<R>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error(`Task timed out after ${timeoutMs}ms (attempt ${attempt})`));
+      }, timeoutMs);
+      promise.then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (error) => {
+          clearTimeout(timer);
+          reject(error);
+        }
+      );
+    });
+  }
+
+  /** Throw an AbortError-shaped error if the configured signal has fired. */
+  private throwIfAborted(): void {
+    if (this.config.signal?.aborted) {
+      const reason = this.config.signal.reason;
+      throw reason instanceof Error ? reason : new Error("Execution aborted");
+    }
+  }
+
+  /** Record a completed task, keeping memory bounded (FIFO eviction). */
+  private recordTask(taskResult: TaskResult): void {
+    const cap = this.config.maxCompletedTasks ?? ConcurrencyDefaultConfig.MAX_COMPLETED_TASKS;
+    if (this.completedTasks.length >= cap) {
+      this.completedTasks.shift();
+    }
+    this.completedTasks.push(taskResult);
+  }
+
+  /**
    * Basic Promise.all approach - All tasks start simultaneously
    * Good for: Independent tasks that can all run at once
    * Bad for: Resource-intensive tasks that might overwhelm the system
@@ -36,6 +101,7 @@ export class ConcurrencyManager {
       console.warn(`🚀 Starting ${tasks.length} tasks concurrently (Promise.all)`);
     }
     this.startTime = Date.now();
+    this.throwIfAborted();
 
     try {
       // All promises start immediately - true concurrency
@@ -44,10 +110,10 @@ export class ConcurrencyManager {
         this.activeTasksCount++;
 
         try {
-          const result = await processor(task);
+          const result = await this.runWithPolicy(task, processor);
           const endTime = Date.now();
 
-          this.completedTasks.push({
+          this.recordTask({
             taskId: `task-${index}`,
             result,
             executionTime: endTime - startTime,
@@ -73,7 +139,46 @@ export class ConcurrencyManager {
   }
 
   /**
-   * Limited concurrency with a lightweight inline limiter
+   * Like executeAllConcurrent, but never fail-fast: every task runs to
+   * completion and the caller gets a per-task settled outcome. Mirrors
+   * Promise.allSettled semantics with the manager's timeout/retry policy.
+   */
+  async executeAllSettled<T, R>(
+    tasks: T[],
+    processor: TaskProcessor<T, R>
+  ): Promise<SettledTaskResult<R>[]> {
+    this.startTime = Date.now();
+    this.throwIfAborted();
+
+    return Promise.all(
+      tasks.map(async (task, index): Promise<SettledTaskResult<R>> => {
+        const startTime = Date.now();
+        this.activeTasksCount++;
+        try {
+          const result = await this.runWithPolicy(task, processor);
+          const endTime = Date.now();
+          this.recordTask({
+            taskId: `settled-task-${index}`,
+            result,
+            executionTime: endTime - startTime,
+            startTime,
+            endTime,
+          });
+          return { status: "fulfilled", value: result, taskIndex: index };
+        } catch (error) {
+          return { status: "rejected", reason: error, taskIndex: index };
+        } finally {
+          this.activeTasksCount--;
+        }
+      })
+    );
+  }
+
+  /**
+   * Limited concurrency with a lightweight inline limiter.
+   * Fail-fast is now genuine: when one task rejects (after retries), the other
+   * worker lanes stop pulling new tasks instead of silently continuing to run
+   * side effects behind an already-rejected promise.
    */
   async executeLimitedConcurrent<T, R>(tasks: T[], processor: TaskProcessor<T, R>): Promise<R[]> {
     if (typeof process.env.CI === "undefined") {
@@ -82,29 +187,36 @@ export class ConcurrencyManager {
       );
     }
     this.startTime = Date.now();
+    this.throwIfAborted();
 
     const concurrency = Math.max(1, this.config.maxConcurrent);
     const results: R[] = new Array(tasks.length);
     let nextIndex = 0;
+    let failed = false;
 
     const runWorker = async (): Promise<void> => {
       for (;;) {
+        if (failed) break;
+        if (this.config.signal?.aborted) this.throwIfAborted();
         const current = nextIndex++;
         if (current >= tasks.length) break;
 
         const startTime = Date.now();
         this.activeTasksCount++;
         try {
-          const result = await processor(tasks[current]);
+          const result = await this.runWithPolicy(tasks[current], processor);
           results[current] = result as R;
           const endTime = Date.now();
-          this.completedTasks.push({
+          this.recordTask({
             taskId: `limited-task-${current}`,
             result,
             executionTime: endTime - startTime,
             startTime,
             endTime,
           });
+        } catch (error) {
+          failed = true;
+          throw error;
         } finally {
           this.activeTasksCount--;
         }
@@ -121,7 +233,8 @@ export class ConcurrencyManager {
   }
 
   /**
-   * Priority queue without external deps
+   * Priority queue without external deps.
+   * Same fail-fast + abort semantics as executeLimitedConcurrent.
    */
   async executePriorityQueue<T, R>(
     tasks: (T & { priority?: number })[],
@@ -130,31 +243,38 @@ export class ConcurrencyManager {
     if (typeof process.env.CI === "undefined") {
       console.warn(`🏆 Starting priority queue with ${tasks.length} tasks`);
     }
+    this.throwIfAborted();
 
     // Sort by priority descending; process with limited concurrency
     const sorted = [...tasks].sort((a, b) => (b.priority || 0) - (a.priority || 0));
     const results: R[] = new Array(sorted.length);
     let nextIndex = 0;
+    let failed = false;
     const concurrency = Math.max(1, this.config.maxConcurrent);
 
     const runWorker = async (): Promise<void> => {
       for (;;) {
+        if (failed) break;
+        if (this.config.signal?.aborted) this.throwIfAborted();
         const idx = nextIndex++;
         if (idx >= sorted.length) break;
         const task = sorted[idx];
         const startTime = Date.now();
         this.activeTasksCount++;
         try {
-          const result = await processor(task);
+          const result = await this.runWithPolicy(task, processor);
           results[idx] = result as R;
           const endTime = Date.now();
-          this.completedTasks.push({
+          this.recordTask({
             taskId: `priority-task-${idx}`,
             result,
             executionTime: endTime - startTime,
             startTime,
             endTime,
           });
+        } catch (error) {
+          failed = true;
+          throw error;
         } finally {
           this.activeTasksCount--;
         }
@@ -185,6 +305,7 @@ export class ConcurrencyManager {
     const results: R[] = [];
 
     for (let i = 0; i < tasks.length; i++) {
+      this.throwIfAborted();
       const task = tasks[i];
       const startTime = Date.now();
 
@@ -193,10 +314,10 @@ export class ConcurrencyManager {
       }
 
       try {
-        const result = await processor(task);
+        const result = await this.runWithPolicy(task, processor);
         const endTime = Date.now();
 
-        this.completedTasks.push({
+        this.recordTask({
           taskId: `sequential-task-${i}`,
           result,
           executionTime: endTime - startTime,
@@ -243,6 +364,7 @@ export class ConcurrencyManager {
 
     // Split tasks into batches
     for (let i = 0; i < tasks.length; i += batchSize) {
+      this.throwIfAborted();
       const batch = tasks.slice(i, i + batchSize);
       const batchNumber = Math.floor(i / batchSize) + 1;
       const totalBatches = Math.ceil(tasks.length / batchSize);
@@ -267,10 +389,17 @@ export class ConcurrencyManager {
   }
 
   /**
+   * Current number of in-flight tasks (useful for monitoring/backpressure).
+   */
+  getActiveTaskCount(): number {
+    return this.activeTasksCount;
+  }
+
+  /**
    * Get performance metrics for analysis
    */
   getPerformanceMetrics(): PerformanceMetrics {
-    const totalExecutionTime = Date.now() - this.startTime;
+    const totalExecutionTime = this.startTime > 0 ? Date.now() - this.startTime : 0;
     const completedTasksCount = this.completedTasks.length;
 
     return {
@@ -282,7 +411,10 @@ export class ConcurrencyManager {
             completedTasksCount
           : 0,
       concurrencyLevel: this.config.maxConcurrent,
-      throughput: completedTasksCount > 0 ? (completedTasksCount / totalExecutionTime) * 1000 : 0,
+      throughput:
+        completedTasksCount > 0 && totalExecutionTime > 0
+          ? (completedTasksCount / totalExecutionTime) * 1000
+          : 0,
     };
   }
 
