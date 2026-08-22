@@ -4,9 +4,23 @@
 import { LimitOpts, LimitResult, RateLimitType } from "./rateLimited-redis";
 
 // In-memory storage for rate limiting data
+
+// Sliding-window log with an advancing head index. Timestamps append at the
+// tail; expired entries are logically removed by advancing `head` (amortized
+// O(1) per hit at steady state) instead of re-allocating the array with
+// `filter` on every request. The buffer is compacted once the dead prefix
+// outgrows the live tail. `sorted` tracks whether appends have stayed
+// monotonic; if a caller ever passes a decreasing nowMs we fall back to a full
+// filter on prune (the old behavior) so correctness never depends on the clock.
+interface SlidingWindowLog {
+  buf: number[];
+  head: number;
+  sorted: boolean;
+}
+
 class RateLimiterStorage {
-  // Sliding window: Map<key, Array<timestamp>>
-  private slidingWindowData = new Map<string, number[]>();
+  // Sliding window: Map<key, SlidingWindowLog>
+  private slidingWindowData = new Map<string, SlidingWindowLog>();
 
   // Fixed window: Map<key, {count: number, windowStart: number}>
   private fixedWindowData = new Map<string, { count: number; windowStart: number }>();
@@ -15,30 +29,60 @@ class RateLimiterStorage {
   private tokenBucketData = new Map<string, { tokens: number; lastRefill: number }>();
 
   // Sliding Window Implementation
+  //
+  // Mirrors the Redis Lua script exactly (comparison tests assert equivalence):
+  // - Reject-before-add: denied hits are not recorded, which bounds the per-key
+  //   array at `limit` entries under flood and means a client that backs off
+  //   recovers as soon as its allowed hits age out (no self-lockout).
+  // - Lazy prune: the old code ran `filter` + reallocated the array on EVERY
+  //   request (O(n) alloc+copy per hit, with n unbounded under flood). We now
+  //   prune only when the oldest entry has actually expired.
   checkSlidingWindow(key: string, limit: number, windowMs: number, now: number): LimitResult {
     const start = now - windowMs;
 
-    // Get existing requests for this key
-    let requests = this.slidingWindowData.get(key) || [];
+    let log = this.slidingWindowData.get(key);
+    if (!log) {
+      log = { buf: [], head: 0, sorted: true };
+      this.slidingWindowData.set(key, log);
+    }
 
-    // Remove old requests outside the window
-    requests = requests.filter((timestamp) => timestamp > start);
+    // Prune expired entries.
+    if (log.sorted) {
+      // Monotonic appends: expired entries form a prefix — advance head, O(1)
+      // amortized. Compact once the dead prefix dominates the buffer.
+      while (log.head < log.buf.length && log.buf[log.head] <= start) {
+        log.head++;
+      }
+      if (log.head > 1024 && log.head * 2 > log.buf.length) {
+        log.buf = log.buf.slice(log.head);
+        log.head = 0;
+      }
+    } else if (log.buf.length > log.head && log.buf[log.head] <= start) {
+      // Non-monotonic history: fall back to a full filter (old behavior).
+      log.buf = log.buf.filter((timestamp) => timestamp > start);
+      log.head = 0;
+    }
 
-    // Add current request
-    requests.push(now);
+    const count = log.buf.length - log.head;
 
-    // Update storage
-    this.slidingWindowData.set(key, requests);
+    if (count >= limit) {
+      // Denied: do NOT record the hit (bounded memory, no self-lockout).
+      const oldest = count > 0 ? log.buf[log.head] : now;
+      return { allowed: false, remaining: 0, resetMs: Math.max(0, oldest + windowMs - now) };
+    }
 
-    const count = requests.length;
-    const allowed = count <= limit;
-    const remaining = Math.max(0, limit - count);
+    // Allowed: record the hit.
+    if (log.buf.length > log.head && now < log.buf[log.buf.length - 1]) {
+      log.sorted = false;
+    }
+    log.buf.push(now);
 
-    // Calculate reset time based on oldest request
-    const oldest = requests.length > 0 ? requests[0] : now;
-    const resetMs = Math.max(0, oldest + windowMs - now);
-
-    return { allowed, remaining, resetMs };
+    const oldest = log.buf[log.head];
+    return {
+      allowed: true,
+      remaining: limit - (count + 1),
+      resetMs: Math.max(0, oldest + windowMs - now),
+    };
   }
 
   // Fixed Window Implementation
@@ -79,12 +123,24 @@ class RateLimiterStorage {
     }
 
     // Calculate tokens to add based on elapsed time
+    // (mirrors the Redis Lua script exactly — comparison tests assert equivalence)
     const timePassed = now - bucket.lastRefill;
-    const tokensToAdd = Math.floor(timePassed / refillMs);
-
-    // Refill tokens (capped at capacity)
-    bucket.tokens = Math.min(capacity, bucket.tokens + tokensToAdd);
-    bucket.lastRefill = bucket.lastRefill + tokensToAdd * refillMs;
+    if (timePassed > 0) {
+      const tokensToAdd = Math.floor(timePassed / refillMs);
+      if (tokensToAdd > 0) {
+        bucket.tokens += tokensToAdd;
+        if (bucket.tokens >= capacity) {
+          // Bucket is full: restart the refill clock at now so a later request
+          // doesn't inherit a stale lastRefill.
+          bucket.tokens = capacity;
+          bucket.lastRefill = now;
+        } else {
+          // Preserve the fractional-token remainder by advancing lastRefill in
+          // whole-token steps only.
+          bucket.lastRefill = bucket.lastRefill + tokensToAdd * refillMs;
+        }
+      }
+    }
 
     // Try to consume one token
     let allowed = false;
@@ -99,8 +155,10 @@ class RateLimiterStorage {
     // Update storage
     this.tokenBucketData.set(key, bucket);
 
-    // Calculate time until next token is available
-    const resetMs = bucket.tokens === 0 ? refillMs : 0;
+    // Time until the NEXT token lands, credited for time already elapsed since
+    // lastRefill. (Returning the full refillMs overstated Retry-After by up to
+    // one whole refill period.)
+    const resetMs = bucket.tokens === 0 ? Math.max(0, refillMs - (now - bucket.lastRefill)) : 0;
 
     return { allowed, remaining, resetMs };
   }
@@ -112,12 +170,12 @@ class RateLimiterStorage {
     const cutoff = now - maxAge;
 
     // Clean sliding window data
-    for (const [key, requests] of this.slidingWindowData.entries()) {
-      const filtered = requests.filter((timestamp) => timestamp > cutoff);
-      if (filtered.length === 0) {
+    for (const [key, log] of this.slidingWindowData.entries()) {
+      const live = log.buf.slice(log.head).filter((timestamp) => timestamp > cutoff);
+      if (live.length === 0) {
         this.slidingWindowData.delete(key);
       } else {
-        this.slidingWindowData.set(key, filtered);
+        this.slidingWindowData.set(key, { buf: live, head: 0, sorted: log.sorted });
       }
     }
 

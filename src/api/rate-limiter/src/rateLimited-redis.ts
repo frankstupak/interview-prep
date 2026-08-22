@@ -31,26 +31,43 @@ export enum RateLimitType {
 }
 
 // Sliding window: sorted set for rolling window. Accurate; more work per request than fixed window.
+//
+// Two hardening fixes vs the naive version:
+// 1. Reject-before-add: denied hits are NOT written to the set. This bounds the
+//    set at `limit` members per key (flood-proof memory) and means a client that
+//    backs off recovers as soon as its *allowed* hits age out, instead of being
+//    locked out by its own rejected traffic.
+// 2. Unique member (ARGV[4]): ZADD with member = tostring(now) silently dedupes
+//    two hits in the same millisecond (sorted-set members are unique), which
+//    undercounts and over-admits under burst. The caller supplies a per-request
+//    unique member instead.
 const SLIDING_WINDOW_LUA = `
--- KEYS[1] = key      ARGV[1]=now  ARGV[2]=winMs  ARGV[3]=limit
-local k   = KEYS[1]
-local now = tonumber(ARGV[1])
-local win = tonumber(ARGV[2])
-local lim = tonumber(ARGV[3])
-local start = now - win
+-- KEYS[1] = key      ARGV[1]=now  ARGV[2]=winMs  ARGV[3]=limit  ARGV[4]=unique member
+local k      = KEYS[1]
+local now    = tonumber(ARGV[1])
+local win    = tonumber(ARGV[2])
+local lim    = tonumber(ARGV[3])
+local member = ARGV[4]
+local start  = now - win
 
 redis.call('ZREMRANGEBYSCORE', k, 0, start)            -- prune old hits
-redis.call('ZADD', k, now, tostring(now))              -- add this hit
-local count = tonumber(redis.call('ZCARD', k))         -- current count
+local count = tonumber(redis.call('ZCARD', k))         -- hits currently in window
+
+if count >= lim then
+  -- Denied: do NOT record the hit (bounded memory, no self-lockout).
+  local oldestPair = redis.call('ZRANGE', k, 0, 0, 'WITHSCORES')
+  local oldest = (oldestPair and #oldestPair >= 2) and tonumber(oldestPair[2]) or now
+  return { 0, 0, math.max(0, oldest + win - now) }
+end
+
+redis.call('ZADD', k, now, member)                     -- record allowed hit
 redis.call('PEXPIRE', k, win)                          -- housekeeping TTL
 
 local oldestPair = redis.call('ZRANGE', k, 0, 0, 'WITHSCORES')
-local oldest = oldestPair and #oldestPair >= 2 and tonumber(oldestPair[2]) or now
+local oldest = (oldestPair and #oldestPair >= 2) and tonumber(oldestPair[2]) or now
 local resetMs = math.max(0, oldest + win - now)
 
-local allowed = (count <= lim) and 1 or 0
-local remaining = math.max(0, lim - count)
-return { allowed, remaining, resetMs }
+return { 1, lim - (count + 1), resetMs }
 `;
 
 // Fixed window: counter per calendar window. Simple and fast; allows 2× burst at window boundaries.
@@ -61,18 +78,27 @@ local now = tonumber(ARGV[1])
 local win = tonumber(ARGV[2])
 local lim = tonumber(ARGV[3])
 
--- Calculate current window start time
-local windowStart = math.floor(now / win) * win
+-- Calculate current window start time.
+-- Written as float modulo (not math.floor(now/win)*win): math.floor coerces to
+-- Lua integers, which overflow on millisecond epochs under 32-bit Lua builds
+-- (e.g. fengari, used by ioredis-mock in tests). Real Redis Lua 5.1 doubles
+-- are fine either way; this form is correct on both.
+local windowStart = now - (now % win)
 local windowEnd = windowStart + win
-local windowKey = k .. ':' .. windowStart
+-- %.0f pins the key suffix to a plain integer string on every Lua build
+-- (5.1 doubles, 5.3 floats, fengari) — bare concatenation of a float is
+-- formatted differently across versions.
+local windowKey = k .. ':' .. string.format('%.0f', windowStart)
 
--- Get current count for this window
-local count = tonumber(redis.call('GET', windowKey) or 0)
+-- Atomic increment (single command instead of GET+SET round trip)
+local count = tonumber(redis.call('INCR', windowKey))
 
--- Increment counter
-count = count + 1
-redis.call('SET', windowKey, count)
-redis.call('PEXPIRE', windowKey, win)
+-- Set the TTL once, on window creation, expiring AT the window end.
+-- (Re-arming PEXPIRE(win) on every hit kept dead window keys alive for up to
+-- a full extra window after their last hit.)
+if count == 1 then
+  redis.call('PEXPIRE', windowKey, string.format('%.0f', math.max(1, windowEnd - now)))
+end
 
 -- Calculate reset time (time until current window ends)
 local resetMs = windowEnd - now
@@ -97,11 +123,22 @@ local lastRefill = tonumber(bucketData[2]) or now
 
 -- Calculate tokens to add based on time elapsed
 local timePassed = now - lastRefill
-local tokensToAdd = math.floor(timePassed / refillMs)
-
--- Refill tokens (capped at capacity)
-tokens = math.min(capacity, tokens + tokensToAdd)
-local newLastRefill = lastRefill + (tokensToAdd * refillMs)
+if timePassed > 0 then
+  local tokensToAdd = math.floor(timePassed / refillMs)
+  if tokensToAdd > 0 then
+    tokens = tokens + tokensToAdd
+    if tokens >= capacity then
+      -- Bucket is full: restart the refill clock at now so a later request
+      -- doesn't inherit a stale lastRefill.
+      tokens = capacity
+      lastRefill = now
+    else
+      -- Preserve the fractional-token remainder by advancing lastRefill in
+      -- whole-token steps only.
+      lastRefill = lastRefill + (tokensToAdd * refillMs)
+    end
+  end
+end
 
 -- Try to consume one token
 local allowed = 0
@@ -113,14 +150,30 @@ if tokens > 0 then
 end
 
 -- Update bucket state
-redis.call('HMSET', k, 'tokens', tokens, 'lastRefill', newLastRefill)
+-- %.0f keeps the stored numbers as plain integer strings on every Lua build
+redis.call('HMSET', k, 'tokens', string.format('%.0f', tokens), 'lastRefill', string.format('%.0f', lastRefill))
 redis.call('PEXPIRE', k, refillMs * capacity * 2) -- TTL for cleanup
 
--- Calculate time until next token is available
-local resetMs = (tokens == 0) and refillMs or 0
+-- Time until the NEXT token lands, credited for time already elapsed since
+-- lastRefill. (Returning the full refillMs overstated Retry-After by up to
+-- one whole refill period.)
+local resetMs = 0
+if tokens == 0 then
+  resetMs = math.max(0, refillMs - (now - lastRefill))
+end
 
 return { allowed, remaining, resetMs }
 `;
+
+// Monotonic per-process sequence for sliding-window member uniqueness. Combined
+// with a random suffix so members are unique across processes sharing one Redis.
+let slidingWindowSeq = 0;
+
+/** Unique sorted-set member for one hit: `<now>-<seq>-<rand>`. */
+function uniqueSlidingWindowMember(now: number): string {
+  slidingWindowSeq = (slidingWindowSeq + 1) % Number.MAX_SAFE_INTEGER;
+  return `${now}-${slidingWindowSeq}-${Math.random().toString(36).slice(2, 10)}`;
+}
 
 export async function checkRateLimitWithSlidingWindow(
   redis: RateLimitRedisClient,
@@ -139,7 +192,8 @@ export async function checkRateLimitWithSlidingWindow(
     redisKey,
     String(now),
     String(windowMs),
-    String(limit)
+    String(limit),
+    uniqueSlidingWindowMember(now)
   )) as [number, number, number];
 
   return { allowed: !!allowed, remaining, resetMs };
