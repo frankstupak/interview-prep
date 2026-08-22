@@ -201,4 +201,98 @@ describe("useWebSocket hook", () => {
 
     unmount();
   });
+
+  it("answers server application-level pings with a pong and keeps heartbeats out of history", async () => {
+    const { result, unmount } = renderHook(() =>
+      useWebSocket({ serverType: "basic", url: "ws://local/hb", autoReconnect: false })
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    const socket = mockSockets[0];
+
+    await act(async () => {
+      socket.onopen?.();
+    });
+    await act(async () => {
+      socket.onmessage?.({
+        data: JSON.stringify({
+          id: "handshake",
+          type: "connect",
+          payload: { clientId: "client-hb" },
+          timestamp: Date.now(),
+        }),
+      });
+    });
+
+    await act(async () => {
+      socket.onmessage?.({
+        data: JSON.stringify({
+          id: "ping-1",
+          type: "ping",
+          payload: { timestamp: 42 },
+          timestamp: Date.now(),
+        }),
+      });
+    });
+
+    // The shipped hook never answered the server's JSON heartbeat, so every
+    // browser client was reaped after pingTimeout despite being alive.
+    const pong = socket.sent
+      .map((raw) => JSON.parse(raw) as { type: string; payload: { timestamp?: number } })
+      .find((message) => message.type === "pong");
+    expect(pong).toBeDefined();
+    expect(pong?.payload.timestamp).toBe(42); // echoed for server-side RTT
+
+    // Heartbeat noise must not consume the 100-slot message history.
+    expect(
+      result.current.messageHistory.every((message) => message.type !== "ping")
+    ).toBe(true);
+
+    unmount();
+  });
+
+  it("backs off exponentially between reconnect attempts", async () => {
+    jest.useFakeTimers();
+    const randomSpy = jest.spyOn(Math, "random").mockReturnValue(1); // deterministic: full delay
+
+    try {
+      const { unmount } = renderHook(() =>
+        useWebSocket({
+          serverType: "basic",
+          url: "ws://local/rc",
+          autoReconnect: true,
+          reconnectInterval: 1000,
+          maxReconnectAttempts: 3,
+        })
+      );
+
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(mockSockets).toHaveLength(1);
+
+      act(() => {
+        mockSockets[0].onclose?.({ code: 1006, reason: "" } as CloseEvent);
+      });
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("attempt 1/3 in 1000ms"));
+
+      act(() => {
+        jest.advanceTimersByTime(1000);
+      });
+      expect(mockSockets).toHaveLength(2);
+
+      act(() => {
+        mockSockets[1].onclose?.({ code: 1006, reason: "" } as CloseEvent);
+      });
+      // Second attempt doubles the base delay (2 ** 1 * 1000).
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("attempt 2/3 in 2000ms"));
+
+      unmount();
+    } finally {
+      randomSpy.mockRestore();
+      jest.useRealTimers();
+    }
+  });
 });

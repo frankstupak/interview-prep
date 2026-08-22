@@ -9,7 +9,7 @@ import type {
   WebSocketHooks,
   WebSocketConfig,
 } from "./types";
-import { isRoomPayload } from "./types";
+import { isRoomPayload, isPayloadObject } from "./types";
 import { MessageType } from "./constants";
 
 export class WebSocketManager {
@@ -21,6 +21,7 @@ export class WebSocketManager {
     startTime: Date.now(),
     messagesLastSecond: 0,
     lastMessageTime: Date.now(),
+    windowCount: 0,
   };
   private hooks: WebSocketHooks = {};
   private pingInterval?: NodeJS.Timeout;
@@ -55,6 +56,19 @@ export class WebSocketManager {
 
     this.clients.set(client.id, client);
     this.stats.totalConnections++;
+
+    // Protocol-level liveness (RFC 6455): raw `ws` sockets emit "pong" in response to
+    // our ping() frames — browsers answer these automatically, so this keeps browser
+    // clients alive even if they never send an application-level ping/pong message.
+    const rawSocket = socket as unknown as {
+      on?: (event: string, listener: () => void) => void;
+      ping?: () => void;
+    };
+    if (typeof rawSocket.on === "function" && typeof rawSocket.ping === "function") {
+      rawSocket.on("pong", () => {
+        client.lastPing = Date.now();
+      });
+    }
 
     // Call onConnect hook
     if (this.hooks.onConnect) {
@@ -113,8 +127,19 @@ export class WebSocketManager {
       if (!message.timestamp) message.timestamp = Date.now();
       message.clientId = clientId;
 
+      // Any inbound traffic proves the connection is alive — refresh liveness so
+      // active clients are never reaped by the heartbeat sweep.
+      client.lastPing = Date.now();
+
       this.stats.totalMessages++;
       this.updateMessagesPerSecond();
+
+      // Gate hook: runs BEFORE built-in handling so policies like rate limiting
+      // also cover join_room/room_message/ping, not just application messages.
+      if (this.hooks.onBeforeMessage) {
+        const allowed = await this.hooks.onBeforeMessage(client, message);
+        if (allowed === false) return;
+      }
 
       // Handle built-in message types
       await this.handleBuiltInMessages(client, message);
@@ -150,9 +175,19 @@ export class WebSocketManager {
         this.sendToClient(client.id, {
           id: uuidv4(),
           type: MessageType.PONG,
-          payload: { timestamp: Date.now() },
+          // Echo the client's payload (e.g. their timestamp) so they can compute RTT.
+          payload: isPayloadObject(message.payload)
+            ? { ...message.payload, timestamp: Date.now() }
+            : { timestamp: Date.now() },
           timestamp: Date.now(),
         });
+        break;
+
+      case MessageType.PONG:
+        // Client answered our application-level heartbeat — mark it alive.
+        // (Previously PONG was silently ignored, so every client that correctly
+        // answered the server's pings was still reaped after pingTimeout.)
+        client.lastPing = Date.now();
         break;
 
       case MessageType.JOIN_ROOM: {
@@ -184,23 +219,42 @@ export class WebSocketManager {
   sendToClient(clientId: string, message: AnyMessage): boolean {
     const client = this.clients.get(clientId);
     if (!client || !client.connected) return false;
+    return this.deliver(client, message);
+  }
 
+  /**
+   * Deliver a message to a client's socket. Accepts an optional pre-serialized
+   * JSON string so broadcasts can stringify once instead of once per recipient.
+   */
+  private deliver(client: WebSocketClient, message: AnyMessage, serialized?: string): boolean {
     try {
-      const messageStr = JSON.stringify(message);
+      const socket = client.socket as unknown as {
+        send?: (data: string) => void;
+        emit?: (event: string, data: unknown) => void;
+        readyState?: number;
+        nsp?: unknown;
+      };
 
-      // Handle different socket types
-      if (client.socket.send) {
-        // Standard WebSocket
-        client.socket.send(messageStr);
-      } else if ("emit" in client.socket && typeof client.socket.emit === "function") {
-        // Socket.IO
-        (client.socket as { emit: (event: string, data: unknown) => void }).emit(
-          MessageType.MESSAGE,
-          message
-        );
+      // Socket.IO sockets are detected via `nsp` and get a structured emit.
+      // (They also have a `send()` method, so the old `if (socket.send)` check
+      // routed them through the raw path and consumers received JSON strings
+      // instead of objects — the emit branch was dead code.)
+      if (socket.nsp !== undefined && typeof socket.emit === "function") {
+        socket.emit(MessageType.MESSAGE, message);
+        return true;
       }
 
-      return true;
+      if (typeof socket.send === "function") {
+        // Raw ws: only OPEN (readyState 1) sockets can send; sending on
+        // CONNECTING throws and on CLOSING/CLOSED it errors into the console.
+        if (typeof socket.readyState === "number" && socket.readyState !== 1) {
+          return false;
+        }
+        socket.send(serialized ?? JSON.stringify(message));
+        return true;
+      }
+
+      return false;
     } catch (error) {
       console.error("Failed to send message to client:", error);
       return false;
@@ -214,8 +268,12 @@ export class WebSocketManager {
     if (roomId) {
       this.broadcastToRoom(roomId, message);
     } else {
+      // Serialize once for all raw-WebSocket recipients instead of once per
+      // recipient — JSON.stringify dominated broadcast cost at fan-out.
+      const serialized = JSON.stringify(message);
       for (const client of this.clients.values()) {
-        this.sendToClient(client.id, message);
+        if (!client.connected) continue;
+        this.deliver(client, message, serialized);
       }
     }
   }
@@ -227,9 +285,12 @@ export class WebSocketManager {
     const room = this.rooms.get(roomId);
     if (!room) return;
 
+    const serialized = JSON.stringify(message);
     for (const clientId of room.clients) {
       if (excludeClientId && clientId === excludeClientId) continue;
-      this.sendToClient(clientId, message);
+      const client = this.clients.get(clientId);
+      if (!client || !client.connected) continue;
+      this.deliver(client, message, serialized);
     }
   }
 
@@ -313,7 +374,10 @@ export class WebSocketManager {
       totalConnections: this.stats.totalConnections,
       activeConnections: this.clients.size,
       totalMessages: this.stats.totalMessages,
-      messagesPerSecond: this.stats.messagesLastSecond,
+      // Report the last completed 1s window; decay to 0 when idle instead of
+      // pinning the last observed value forever.
+      messagesPerSecond:
+        Date.now() - this.stats.lastMessageTime >= 2000 ? 0 : this.stats.messagesLastSecond,
       rooms: this.rooms.size,
       uptime: uptimeMs,
     };
@@ -343,10 +407,22 @@ export class WebSocketManager {
 
       for (const [clientId, client] of this.clients.entries()) {
         if (now - client.lastPing > timeout) {
-          // Client hasn't responded to ping, disconnect
-          this.removeClient(clientId);
+          // Dead connection: actually close the underlying socket, don't just
+          // forget about it (previously the socket was left open and leaked).
+          this.closeSocket(client);
+          void this.removeClient(clientId);
         } else {
-          // Send ping
+          // Protocol-level ping for raw ws sockets — browsers/ws clients answer
+          // automatically with a pong frame (see the ws README heartbeat pattern).
+          const rawSocket = client.socket as unknown as { ping?: () => void };
+          if (typeof rawSocket.ping === "function") {
+            try {
+              rawSocket.ping();
+            } catch {
+              // Socket already closing; the timeout sweep will reap it.
+            }
+          }
+          // Application-level ping for clients that implement JSON heartbeats.
           this.sendToClient(clientId, {
             id: uuidv4(),
             type: MessageType.PING,
@@ -356,6 +432,37 @@ export class WebSocketManager {
         }
       }
     }, this.config.pingInterval);
+    // Never let the heartbeat timer keep the process alive on its own.
+    this.pingInterval.unref?.();
+  }
+
+  /**
+   * Best-effort close of the underlying transport (ws terminate / Socket.IO disconnect).
+   */
+  private closeSocket(client: WebSocketClient): void {
+    const socket = client.socket as unknown as {
+      terminate?: () => void;
+      disconnect?: (close?: boolean) => void;
+      close?: () => void;
+    };
+    try {
+      if (typeof socket.terminate === "function") {
+        socket.terminate();
+      } else if (typeof socket.disconnect === "function") {
+        socket.disconnect(true);
+      } else if (typeof socket.close === "function") {
+        socket.close();
+      }
+    } catch {
+      // Already closed.
+    }
+  }
+
+  /**
+   * Synchronously check whether a client is registered.
+   */
+  hasClient(clientId: string): boolean {
+    return this.clients.has(clientId);
   }
 
   /**
@@ -364,10 +471,14 @@ export class WebSocketManager {
   private updateMessagesPerSecond(): void {
     const now = Date.now();
     if (now - this.stats.lastMessageTime >= 1000) {
-      this.stats.messagesLastSecond = 0;
+      // Close the previous 1s window and report ITS count; the old code zeroed
+      // the counter and reported the partial current window instead, so the
+      // stat never reflected an actual per-second rate (and never decayed).
+      this.stats.messagesLastSecond = this.stats.windowCount;
+      this.stats.windowCount = 0;
       this.stats.lastMessageTime = now;
     }
-    this.stats.messagesLastSecond++;
+    this.stats.windowCount++;
   }
 
   /**
@@ -378,9 +489,11 @@ export class WebSocketManager {
       clearInterval(this.pingInterval);
     }
 
-    // Disconnect all clients
-    for (const clientId of this.clients.keys()) {
-      this.removeClient(clientId);
+    // Disconnect all clients — close the underlying sockets too, so server
+    // shutdown doesn't strand open connections.
+    for (const [clientId, client] of this.clients.entries()) {
+      this.closeSocket(client);
+      void this.removeClient(clientId);
     }
 
     this.clients.clear();

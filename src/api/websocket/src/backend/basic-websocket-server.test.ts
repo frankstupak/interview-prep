@@ -336,6 +336,13 @@ describe("BasicWebSocketServer", () => {
     test("should handle room-based communication", (done) => {
       let connectionsReady = 0;
       let roomJoined = 0;
+      // These were assigned below without ever being declared — a strict-mode
+      // ReferenceError inside the message handler, which swallowed the room
+      // flow and made this test time out as shipped.
+      let client1Id: string | undefined;
+      let client2Id: string | undefined;
+      void client1Id;
+      void client2Id;
 
       const checkReady = (): void => {
         connectionsReady++;
