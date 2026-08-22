@@ -20,21 +20,20 @@
     "lint:fix": "eslint 'src/**/*.ts' --fix && npm run format",
     "format": "prettier --write 'src/**/*.{ts,js,json}' '*.md'",
     "format:check": "prettier --check 'src/**/*.{ts,js,json}' '*.md'",
-    "openapi": "tsx src/generate-openapi.ts"
+    "openapi": "tsx src/generate-openapi.ts",
+    "bench:prefix": "tsx bench/prefix-bench.ts"
   },
   "dependencies": {
     "@fastify/cors": "^11.2.0",
     "@fastify/static": "^9.0.0",
+    "@fastify/swagger": "^9.7.0",
     "fastify": "^5.7.4",
     "fuse.js": "^7.0.0",
-    "lodash": "^4.17.21",
-    "lodash.debounce": "^4.0.8",
     "redis": "^4.6.10",
     "zod": "^3.23.8"
   },
   "devDependencies": {
     "@types/jest": "^29.5.5",
-    "@types/lodash.debounce": "^4.0.7",
     "@types/node": "^20.8.0",
     "concurrently": "^8.2.2",
     "jest": "^29.7.0",

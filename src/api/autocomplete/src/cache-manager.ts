@@ -374,11 +374,23 @@ export class CacheManager {
    * Ensures consistent key generation for identical requests
    */
   generateCacheKey(request: AutocompleteRequest): string {
+    // The key MUST cover every request parameter that changes the response.
+    // The previous key omitted `category` and `tags`, so a cached result for
+    // ?q=x&category=books was served verbatim to ?q=x&category=movies -
+    // cross-filter cache poisoning. Query/category/tags are normalized the
+    // same way the search engine normalizes them, so equivalent requests
+    // ("Test" vs "test") share one entry instead of duplicating cache slots.
     const parts = [
-      request.query,
+      request.query.trim().toLowerCase(),
       request.limit?.toString() || "default",
-      request.fuzzy?.toString() || "false",
-      request.threshold?.toString() || "default",
+      // Engine semantics: fuzzy defaults to TRUE (fuzzy !== false). The old
+      // key stringified undefined as "false" - the opposite of reality.
+      (request.fuzzy !== false).toString(),
+      request.threshold !== undefined ? request.threshold.toString() : "default",
+      request.category?.trim().toLowerCase() || "any",
+      request.tags && request.tags.length > 0
+        ? [...request.tags].map((t) => t.trim().toLowerCase()).sort().join(",")
+        : "any",
       request.fields?.join(",") || "all",
     ];
 

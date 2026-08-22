@@ -13,7 +13,7 @@ import { AutocompleteService } from "./autocomplete-service";
 import { SearchEngine } from "./search-engine";
 import { CacheManager, MemoryCacheProvider } from "./cache-manager";
 import { StaticDataSource, DataSourceManager } from "./data-source";
-import { AutocompleteItem, AutocompleteConfig, DataSource, AutocompleteRequest } from "./types.js";
+import { AutocompleteItem, AutocompleteConfig, DataSource, AutocompleteRequest, AutocompleteResponse } from "./types.js";
 
 const consoleLogSpy = jest.spyOn(console, "log").mockImplementation(() => {});
 const consoleWarnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
@@ -676,6 +676,300 @@ describe("Integration Tests", () => {
 
       expect(results).toHaveLength(100);
       expect(avgTime).toBeLessThan(50); // Average should be under 50ms per search
+    });
+  });
+});
+
+describe("Uplift regression tests", () => {
+  describe("SearchEngine: prefix strategy uses a real prefix index", () => {
+    let engine: SearchEngine;
+
+    beforeEach(() => {
+      engine = new SearchEngine(defaultConfig.search);
+      engine.buildIndex(sampleItems);
+    });
+
+    it("short queries return items whose tokens start with the prefix", async () => {
+      // Queries of length <= 2 route to the prefix strategy. The old code
+      // passed "^ja" to Fuse without useExtendedSearch, so the caret was
+      // matched as a literal character.
+      const response = await engine.search({ query: "ja", limit: 10 });
+
+      expect(response.metadata.searchType).toBe("prefix");
+      expect(response.results.length).toBeGreaterThan(0);
+      expect(
+        response.results.every(
+          (r) =>
+            r.item.title.toLowerCase().startsWith("ja") ||
+            r.item.title
+              .toLowerCase()
+              .split(/\s+/)
+              .some((w) => w.startsWith("ja")) ||
+            r.item.tags.some((t) => t.toLowerCase().startsWith("ja"))
+        )
+      ).toBe(true);
+    });
+
+    it("prefix matches work through tags", async () => {
+      const response = await engine.search({ query: "ui", limit: 10 });
+
+      expect(response.results.some((r) => r.item.title === "React")).toBe(true);
+    });
+  });
+
+  describe("SearchEngine: exact strategy is actually exact", () => {
+    let engine: SearchEngine;
+
+    beforeEach(() => {
+      engine = new SearchEngine(defaultConfig.search);
+      engine.buildIndex(sampleItems);
+    });
+
+    it("quoted queries only match items containing the exact phrase", async () => {
+      const response = await engine.search({ query: '"node.js"', limit: 10 });
+
+      expect(response.metadata.searchType).toBe("exact");
+      expect(response.results.length).toBeGreaterThan(0);
+      expect(
+        response.results.every((r) =>
+          [r.item.title, r.item.description || "", ...r.item.tags]
+            .join(" ")
+            .toLowerCase()
+            .includes("node.js")
+        )
+      ).toBe(true);
+    });
+
+    it("quoted nonsense phrases match nothing", async () => {
+      const response = await engine.search({ query: '"zzz not a phrase"', limit: 10 });
+      expect(response.results).toHaveLength(0);
+    });
+  });
+
+  describe("SearchEngine: threshold 0 is honored (falsy-zero bug)", () => {
+    let engine: SearchEngine;
+
+    beforeEach(() => {
+      engine = new SearchEngine(defaultConfig.search);
+      engine.buildIndex(sampleItems);
+    });
+
+    it("threshold 0 excludes fuzzy (imperfect) matches", async () => {
+      // "Javscript" is a typo; every match has score > 0. With threshold 0
+      // the old code silently replaced 0 with the 0.3 default and returned
+      // fuzzy matches anyway.
+      const response = await engine.search({ query: "Javscript", limit: 10, threshold: 0 });
+
+      expect(response.results).toHaveLength(0);
+    });
+  });
+
+  describe("SearchEngine: filters apply before the limit", () => {
+    it("category filter finds items past the pre-filter cutoff", async () => {
+      const engine = new SearchEngine(defaultConfig.search);
+
+      // 20 category-A items indexed first, 5 category-B items last. The old
+      // code fetched only `limit` candidates and THEN filtered, so category B
+      // + a small limit returned zero results despite 5 matching items.
+      const bulk: AutocompleteItem[] = [];
+      for (let i = 0; i < 20; i++) {
+        bulk.push({
+          id: `a-${i}`,
+          title: `widget alpha ${i}`,
+          category: "CatA",
+          tags: ["widget"],
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        });
+      }
+      for (let i = 0; i < 5; i++) {
+        bulk.push({
+          id: `b-${i}`,
+          title: `widget beta ${i}`,
+          category: "CatB",
+          tags: ["widget"],
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        });
+      }
+      engine.buildIndex(bulk);
+
+      // 2-char query -> deterministic prefix strategy
+      const response = await engine.search({ query: "wi", limit: 3, category: "CatB" });
+
+      expect(response.results.length).toBeGreaterThan(0);
+      expect(response.results.every((r) => r.item.category === "CatB")).toBe(true);
+      expect(response.results.length).toBeLessThanOrEqual(3);
+    });
+  });
+
+  describe("SearchEngine: highlighting escapes HTML (stored XSS)", () => {
+    it("item data containing markup is escaped in highlighted fields", async () => {
+      const engine = new SearchEngine(defaultConfig.search);
+      engine.buildIndex([
+        {
+          id: "xss-1",
+          title: '<img src=x onerror=alert(1)> Widget',
+          description: '<script>steal()</script> a widget',
+          category: "Test",
+          tags: ["widget"],
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+      ]);
+
+      const response = await engine.search({ query: "Widget", limit: 5 });
+
+      expect(response.results.length).toBeGreaterThan(0);
+      const { highlightedTitle, highlightedDescription } = response.results[0];
+
+      expect(highlightedTitle).not.toContain("<img");
+      expect(highlightedTitle).toContain("&lt;img");
+      expect(highlightedDescription).not.toContain("<script>");
+      // <mark> tags themselves must survive
+      expect(`${highlightedTitle}${highlightedDescription}`).toContain("<mark>");
+    });
+  });
+
+  describe("SearchEngine: popular query average is a true running mean", () => {
+    it("avgExecutionTime equals the arithmetic mean of recorded times", async () => {
+      const engine = new SearchEngine(defaultConfig.search);
+      engine.buildIndex(sampleItems);
+
+      await engine.search({ query: "JavaScript", limit: 5 });
+      await engine.search({ query: "JavaScript", limit: 5 });
+      await engine.search({ query: "JavaScript", limit: 5 });
+
+      const analytics = engine.getAnalytics();
+      const times = analytics.recentSearches
+        .filter((s) => s.query === "javascript")
+        .map((s) => s.executionTime);
+      const mean = times.reduce((a, b) => a + b, 0) / times.length;
+
+      const popular = analytics.indexStats.popularQueries.find((p) => p.query === "javascript");
+      expect(popular).toBeDefined();
+      expect(popular!.count).toBe(3);
+      expect(popular!.avgExecutionTime).toBeCloseTo(mean, 6);
+    });
+  });
+
+  describe("CacheManager: cache key covers all response-affecting params", () => {
+    let cacheManager: CacheManager;
+
+    const mockResponse = (query: string): AutocompleteResponse => ({
+      query,
+      results: [],
+      totalCount: 0,
+      executionTime: 1,
+      metadata: { searchType: "fuzzy" as const, cacheHit: false, indexSize: 5 },
+    });
+
+    beforeEach(() => {
+      cacheManager = new CacheManager(new MemoryCacheProvider(50), defaultConfig.cache);
+    });
+
+    it("different categories never share a cache entry (poisoning regression)", async () => {
+      await cacheManager.set({ query: "x", category: "books" }, mockResponse("x"));
+
+      const other = await cacheManager.get({ query: "x", category: "movies" });
+      const same = await cacheManager.get({ query: "x", category: "books" });
+
+      expect(other).toBeNull();
+      expect(same).not.toBeNull();
+    });
+
+    it("different tags never share a cache entry", async () => {
+      await cacheManager.set({ query: "x", tags: ["a"] }, mockResponse("x"));
+
+      expect(await cacheManager.get({ query: "x", tags: ["b"] })).toBeNull();
+      expect(await cacheManager.get({ query: "x", tags: ["a"] })).not.toBeNull();
+    });
+
+    it("tag order does not fragment the cache", async () => {
+      await cacheManager.set({ query: "x", tags: ["a", "b"] }, mockResponse("x"));
+
+      expect(await cacheManager.get({ query: "x", tags: ["b", "a"] })).not.toBeNull();
+    });
+
+    it("query case/whitespace is normalized (strict assertion, not toBeDefined)", async () => {
+      await cacheManager.set({ query: "Test", limit: 5 }, mockResponse("test"));
+
+      expect(await cacheManager.get({ query: "  test ", limit: 5 })).not.toBeNull();
+    });
+
+    it("fuzzy default (undefined) and explicit true share an entry", async () => {
+      await cacheManager.set({ query: "x" }, mockResponse("x"));
+
+      expect(await cacheManager.get({ query: "x", fuzzy: true })).not.toBeNull();
+      expect(await cacheManager.get({ query: "x", fuzzy: false })).toBeNull();
+    });
+  });
+
+  describe("AutocompleteService: server-side debounce removed", () => {
+    it("concurrent distinct requests each receive their own response, even with debounceMs configured", async () => {
+      // With the old lodash.debounce wrapper and debounceMs > 0, concurrent
+      // callers either received `undefined` (no prior invocation) or the
+      // LAST caller's response - cross-request response leakage.
+      const service = new AutocompleteService({
+        ...defaultConfig,
+        api: { ...defaultConfig.api, debounceMs: 300 },
+      });
+      await service.initialize([
+        {
+          id: "s",
+          name: "s",
+          type: "static",
+          config: { data: sampleItems },
+          itemCount: sampleItems.length,
+        },
+      ]);
+
+      try {
+        const [a, b] = await Promise.all([
+          service.search({ query: "JavaScript", limit: 5 }),
+          service.search({ query: "Python", limit: 5 }),
+        ]);
+
+        expect(a).toBeDefined();
+        expect(b).toBeDefined();
+        expect(a.query).toBe("javascript");
+        expect(b.query).toBe("python");
+        expect(a.results.some((r) => r.item.title === "JavaScript")).toBe(true);
+        expect(b.results.some((r) => r.item.title === "Python")).toBe(true);
+      } finally {
+        await service.shutdown();
+      }
+    });
+
+    it("identical concurrent requests are single-flighted onto one engine search", async () => {
+      const service = new AutocompleteService({
+        ...defaultConfig,
+        cache: { ...defaultConfig.cache, enabled: false }, // isolate single-flight from cache
+      });
+      await service.initialize([
+        {
+          id: "s",
+          name: "s",
+          type: "static",
+          config: { data: sampleItems },
+          itemCount: sampleItems.length,
+        },
+      ]);
+
+      try {
+        const engine = (service as unknown as { searchEngine: SearchEngine }).searchEngine;
+        const spy = jest.spyOn(engine, "search");
+
+        const responses = await Promise.all(
+          Array.from({ length: 5 }, () => service.search({ query: "JavaScript", limit: 5 }))
+        );
+
+        expect(spy).toHaveBeenCalledTimes(1);
+        expect(responses).toHaveLength(5);
+        expect(responses.every((r) => r.results.length > 0)).toBe(true);
+      } finally {
+        await service.shutdown();
+      }
     });
   });
 });
