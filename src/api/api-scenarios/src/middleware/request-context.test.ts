@@ -109,7 +109,8 @@ describe("request-context middleware", () => {
       expect((request.headers as Record<string, string>).authorization).toBe("Bearer token");
       await requestContextMiddleware(request, reply as FastifyReply);
 
-      expect(verifyMock).toHaveBeenCalledWith("token", "unit-secret");
+      // Algorithm allowlist is now pinned per RFC 8725 §3.1.
+      expect(verifyMock).toHaveBeenCalledWith("token", "unit-secret", { algorithms: ["HS256"] });
       expect(request.requestContext.userId).toBe("user-123");
       expect(request.requestContext.userRole).toBe(UserRole.ADMIN);
       expect(request.requestContext.ip).toBe("203.0.113.10");
@@ -132,7 +133,9 @@ describe("request-context middleware", () => {
 
       await requestContextMiddleware(request, reply as FastifyReply);
 
-      expect(verifyMock).toHaveBeenCalledWith("bad-token", "test-secret");
+      expect(verifyMock).toHaveBeenCalledWith("bad-token", "test-secret", {
+        algorithms: ["HS256"],
+      });
       expect(request.requestContext?.userId).toBeUndefined();
       expect(request.log.warn).toHaveBeenCalled();
     });

@@ -20,6 +20,11 @@ import jwt from "jsonwebtoken";
 import { RequestContext } from "../types/common";
 import { HttpStatus, UserErrorCode, AUTH_HEADER_BEARER_PREFIX } from "../constants";
 
+/** RFC 8725 §3.1: verification must run against an explicit algorithm
+ *  allowlist — never the algorithm named by the (attacker-controlled)
+ *  token header. This app signs HS256 only. */
+const JWT_ALLOWED_ALGORITHMS: jwt.Algorithm[] = ["HS256"];
+
 const jwtPayloadSchema = z
   .object({
     userId: z.string().optional(),
@@ -92,8 +97,10 @@ export async function requestContextMiddleware(
     const jwtSecret = getJwtSecret();
     if (jwtSecret) {
       try {
-        const token = authHeader.substring(7);
-        const decoded = jwt.verify(token, jwtSecret);
+        const token = authHeader.substring(AUTH_HEADER_BEARER_PREFIX.length);
+        // RFC 8725 §3.1: pin the accepted algorithm set. Without this,
+        // jsonwebtoken accepts any HMAC variant the token header names.
+        const decoded = jwt.verify(token, jwtSecret, { algorithms: JWT_ALLOWED_ALGORITHMS });
         const parsed = jwtPayloadSchema.safeParse(decoded);
         if (parsed.success) {
           context.userId = parsed.data.userId ?? parsed.data.sub;
@@ -202,7 +209,7 @@ export function extractUserContext(token: string): {
     return null;
   }
   try {
-    const decoded = jwt.verify(token, jwtSecret);
+    const decoded = jwt.verify(token, jwtSecret, { algorithms: JWT_ALLOWED_ALGORITHMS });
     const parsed = jwtPayloadSchema.safeParse(decoded);
     if (!parsed.success) {
       return null;
@@ -322,24 +329,87 @@ export function requireRole(allowedRoles: string[]) {
 
 /**
  * Request Rate Limiting Context
- * Adds rate limiting information to request context
+ * Real per-client fixed-window rate limiter (was: hardcoded placeholder
+ * headers advertising limit=1000/remaining=999 with no enforcement).
+ *
+ * - Window/limit configurable via RATE_LIMIT_MAX / RATE_LIMIT_WINDOW_MS
+ *   (defaults preserve the previously advertised 1000 req/hour policy).
+ * - Emits the widely deployed X-RateLimit-Limit/-Remaining/-Reset headers
+ *   (the de facto convention retained by the IETF ratelimit-headers draft)
+ *   with values that now reflect actual counters.
+ * - Over-limit requests get 429 + Retry-After (delay-seconds).
+ * - Keyed by requestContext.ip; expired windows are pruned lazily.
  */
+interface RateWindow {
+  count: number;
+  resetAt: number; // epoch ms when the window resets
+}
+
+const rateWindows = new Map<string, RateWindow>();
+let lastPruneAt = 0;
+
+function rateLimitConfig(): { max: number; windowMs: number } {
+  const max = Number.parseInt(process.env.RATE_LIMIT_MAX ?? "", 10);
+  const windowMs = Number.parseInt(process.env.RATE_LIMIT_WINDOW_MS ?? "", 10);
+  return {
+    max: Number.isFinite(max) && max > 0 ? max : 1000,
+    windowMs: Number.isFinite(windowMs) && windowMs > 0 ? windowMs : 60 * 60 * 1000,
+  };
+}
+
+/** Drop expired windows at most once per minute so the map cannot grow unbounded. */
+function pruneRateWindows(now: number): void {
+  if (now - lastPruneAt < 60_000) return;
+  lastPruneAt = now;
+  for (const [key, window] of rateWindows) {
+    if (now >= window.resetAt) rateWindows.delete(key);
+  }
+}
+
+/** Test/ops hook: clear all rate-limit state. */
+export function resetRateLimitState(): void {
+  rateWindows.clear();
+  lastPruneAt = 0;
+}
+
 export async function rateLimitContext(
   request: FastifyRequest,
   reply: FastifyReply
 ): Promise<void> {
-  // This would integrate with a rate limiting service
-  // For now, we'll add placeholder headers
+  const { max, windowMs } = rateLimitConfig();
+  const now = Date.now();
+  pruneRateWindows(now);
 
-  const rateLimitInfo = {
-    limit: 1000, // requests per hour
-    remaining: 999,
-    reset: Date.now() + 60 * 60 * 1000, // 1 hour from now
-  };
+  const key = request.requestContext?.ip ?? request.socket.remoteAddress ?? "unknown";
+  let window = rateWindows.get(key);
+  if (!window || now >= window.resetAt) {
+    window = { count: 0, resetAt: now + windowMs };
+    rateWindows.set(key, window);
+  }
+  window.count++;
 
-  reply.header("X-RateLimit-Limit", rateLimitInfo.limit.toString());
-  reply.header("X-RateLimit-Remaining", rateLimitInfo.remaining.toString());
-  reply.header("X-RateLimit-Reset", rateLimitInfo.reset.toString());
+  const remaining = Math.max(0, max - window.count);
+  reply.header("X-RateLimit-Limit", max.toString());
+  reply.header("X-RateLimit-Remaining", remaining.toString());
+  reply.header("X-RateLimit-Reset", window.resetAt.toString());
+
+  if (window.count > max) {
+    const retryAfterSeconds = Math.max(1, Math.ceil((window.resetAt - now) / 1000));
+    reply.header("Retry-After", retryAfterSeconds.toString());
+    reply.code(429).send({
+      success: false,
+      error: {
+        code: "RATE_LIMIT_EXCEEDED",
+        message: "Too many requests, please retry later",
+        statusCode: 429,
+      },
+      meta: {
+        timestamp: new Date().toISOString(),
+        requestId: request.requestContext?.requestId ?? "unknown",
+      },
+    });
+    return;
+  }
 }
 
 /**
