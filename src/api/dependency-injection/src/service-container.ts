@@ -15,6 +15,105 @@ import {
   ContainerEventListener,
   DIConfiguration,
 } from "./di-types";
+import { AsyncLocalStorage } from "node:async_hooks";
+
+/**
+ * Per-resolution context shared across the async call-tree of a single
+ * top-level resolve(). Threaded via AsyncLocalStorage so that dependencies
+ * resolved *inside* a factory (container.resolve(...) calls) participate in the
+ * same circular-dependency guard and depth limit as declared dependencies.
+ * Without this, a cycle formed purely through factory self-resolution bypassed
+ * the guard and recursed until a native RangeError (stack overflow).
+ */
+interface ResolutionContext {
+  resolving: Set<string>;
+  chain: string[];
+}
+
+const resolutionStore = new AsyncLocalStorage<ResolutionContext>();
+
+/**
+ * Run `fn` inside a resolution context. Nested (factory-initiated) resolves
+ * reuse the in-flight context; a fresh top-level resolve starts a new one.
+ */
+function withResolutionContext<T>(fn: () => Promise<T>): Promise<T> {
+  const existing = resolutionStore.getStore();
+  if (existing) {
+    return fn();
+  }
+  return resolutionStore.run({ resolving: new Set<string>(), chain: [] }, fn);
+}
+
+/**
+ * Finalize a freshly-created service instance: resolve any Promise-valued
+ * fields the factory returned, then invoke initialize() if present. Shared by
+ * the singleton/transient path and the scoped path so every lifetime gets
+ * identical post-construction handling (scoped services previously got neither).
+ */
+async function finalizeInstance<T>(raw: unknown): Promise<T> {
+  let instance: unknown = raw;
+
+  if (instance && typeof instance === "object" && !Array.isArray(instance)) {
+    const entries = Object.entries(instance);
+    if (entries.some(([, v]) => v && typeof (v as Promise<unknown>).then === "function")) {
+      const resolvedEntries = await Promise.all(
+        entries.map(async ([k, v]) => {
+          if (v && typeof (v as Promise<unknown>).then === "function") {
+            return [k, await (v as Promise<unknown>)] as const;
+          }
+          return [k, v] as const;
+        })
+      );
+      instance = Object.fromEntries(resolvedEntries);
+    }
+  }
+
+  const withInit = instance as { initialize?: () => Promise<void> };
+  if (withInit && typeof withInit.initialize === "function") {
+    await withInit.initialize();
+  }
+
+  return instance as T;
+}
+
+/**
+ * Canonical key for a cycle: rotate so the lexicographically-smallest member is
+ * first, so the same cycle discovered from different entry points dedupes.
+ */
+function canonicalCycleKey(cycle: string[]): string {
+  if (cycle.length === 0) return "";
+  let min = 0;
+  for (let i = 1; i < cycle.length; i++) {
+    if (cycle[i] < cycle[min]) min = i;
+  }
+  return [...cycle.slice(min), ...cycle.slice(0, min)].join("->");
+}
+
+/**
+ * Create a scoped-lifetime instance with the same cycle guard + finalization as
+ * the root container. Participates in the active ResolutionContext when one
+ * exists (established by withResolutionContext in ScopedContainer.resolve).
+ */
+async function createScopedInstance<T>(
+  scope: ScopedContainer,
+  registration: ServiceRegistration,
+  context: ServiceContext | undefined,
+  name: string
+): Promise<T> {
+  const store = resolutionStore.getStore();
+  if (store?.resolving.has(name)) {
+    throw new Error(`Circular dependency detected: ${[...store.chain, name].join(" -> ")}`);
+  }
+  store?.resolving.add(name);
+  store?.chain.push(name);
+  try {
+    const raw = await registration.factory(scope, context);
+    return await finalizeInstance<T>(raw);
+  } finally {
+    store?.resolving.delete(name);
+    store?.chain.pop();
+  }
+}
 
 /**
  * Core service container implementation
@@ -22,6 +121,7 @@ import {
  */
 export class DefaultServiceContainer implements ServiceContainer {
   private registrations = new Map<string, ServiceRegistration>();
+  private tagIndex = new Map<string, Set<string>>();
   private singletonInstances = new Map<string, unknown>();
   private pendingSingletons = new Map<string, Promise<unknown>>();
   private eventListeners = new Map<ContainerEvent, ContainerEventListener[]>();
@@ -90,6 +190,18 @@ export class DefaultServiceContainer implements ServiceContainer {
 
     // Store registration (widen to unknown for storage; T is preserved at resolve<T>)
     this.registrations.set(registration.name, registration as ServiceRegistration<unknown>);
+
+    // Maintain the tag index so resolveAll(tag) is O(k) instead of an O(n) scan.
+    if (registration.tags) {
+      for (const tag of registration.tags) {
+        let names = this.tagIndex.get(tag);
+        if (!names) {
+          names = new Set<string>();
+          this.tagIndex.set(tag, names);
+        }
+        names.add(registration.name);
+      }
+    }
 
     // Update statistics
     // Why: Track registration metrics for monitoring
@@ -168,42 +280,41 @@ export class DefaultServiceContainer implements ServiceContainer {
     }
 
     const startTime = performance.now();
-    const dependencyChain: string[] = [];
 
-    try {
-      const result = await this.resolveInternal<T>(
-        name,
-        context,
-        dependencyChain,
-        new Set<string>()
-      );
+    // Establish (or join) a resolution context so factory-initiated resolves
+    // share one circular-dependency guard and depth counter with declared deps.
+    return withResolutionContext(async () => {
+      const store = resolutionStore.getStore()!;
+      try {
+        const result = await this.resolveInternal<T>(name, context, store.chain, store.resolving);
 
-      // Update statistics
-      // Why: Track resolution performance and usage patterns
-      this.statistics.totalResolutions++;
-      const resolutionTime = performance.now() - startTime;
-      this.updateAverageResolutionTime(resolutionTime);
+        // Update statistics
+        // Why: Track resolution performance and usage patterns
+        this.statistics.totalResolutions++;
+        const resolutionTime = performance.now() - startTime;
+        this.updateAverageResolutionTime(resolutionTime);
 
-      // Emit resolution event
-      this.emitEvent(ContainerEvent.SERVICE_RESOLVED, {
-        serviceName: name,
-        resolutionTime,
-        context,
-        metadata: { dependencyChain },
-      });
+        // Emit resolution event
+        this.emitEvent(ContainerEvent.SERVICE_RESOLVED, {
+          serviceName: name,
+          resolutionTime,
+          context,
+          metadata: { dependencyChain: [...store.chain] },
+        });
 
-      return result;
-    } catch (error) {
-      // Emit error event
-      this.emitEvent(ContainerEvent.RESOLUTION_ERROR, {
-        serviceName: name,
-        error: error as Error,
-        context,
-        metadata: { dependencyChain },
-      });
+        return result;
+      } catch (error) {
+        // Emit error event
+        this.emitEvent(ContainerEvent.RESOLUTION_ERROR, {
+          serviceName: name,
+          error: error as Error,
+          context,
+          metadata: {},
+        });
 
-      throw error;
-    }
+        throw error;
+      }
+    });
   }
 
   /**
@@ -323,34 +434,11 @@ export class DefaultServiceContainer implements ServiceContainer {
       }
     }
 
-    // Create service instance using factory
-    let instance: unknown = await registration.factory(this, context);
-
-    // If factory returned a plain object with Promise values, resolve them
-    if (instance && typeof instance === "object" && !Array.isArray(instance)) {
-      const entries = Object.entries(instance);
-      if (entries.some(([, v]) => v && typeof (v as Promise<unknown>).then === "function")) {
-        const resolvedEntries = await Promise.all(
-          entries.map(async ([k, v]) => {
-            if (v && typeof (v as Promise<unknown>).then === "function") {
-              const resolved = await (v as Promise<unknown>);
-              return [k, resolved];
-            }
-            return [k, v];
-          })
-        );
-        instance = Object.fromEntries(resolvedEntries);
-      }
-    }
-
-    // Initialize service if it has an initialize method
-    // Why: Allow services to perform setup after creation
-    const withInit = instance as { initialize?: () => Promise<void> };
-    if (withInit && typeof withInit.initialize === "function") {
-      await withInit.initialize();
-    }
-
-    return instance as T;
+    // Create the instance via the factory, then finalize it (resolve any
+    // Promise-valued fields and invoke initialize()). finalizeInstance is shared
+    // with the scoped path so every lifetime gets identical handling.
+    const raw = await registration.factory(this, context);
+    return finalizeInstance<T>(raw);
   }
 
   /**
@@ -360,10 +448,12 @@ export class DefaultServiceContainer implements ServiceContainer {
   async resolveAll<T>(tag: string, context?: ServiceContext): Promise<T[]> {
     const services: T[] = [];
 
-    for (const registration of this.registrations.values()) {
-      if (registration.tags && registration.tags.includes(tag)) {
-        const service = await this.resolve<T>(registration.name, context);
-        services.push(service);
+    // O(k) tag lookup via the tag index instead of an O(n) scan over every
+    // registration. Set iteration preserves registration order.
+    const names = this.tagIndex.get(tag);
+    if (names) {
+      for (const name of names) {
+        services.push(await this.resolve<T>(name, context));
       }
     }
 
@@ -424,7 +514,8 @@ export class DefaultServiceContainer implements ServiceContainer {
       context || {
         requestId: crypto.randomUUID(),
         startTime: Date.now(),
-      }
+      },
+      this.configuration.scopeTimeout ?? 30000
     );
 
     this.emitEvent(ContainerEvent.SCOPE_CREATED, {
@@ -451,6 +542,17 @@ export class DefaultServiceContainer implements ServiceContainer {
    */
   getParent(): ServiceContainer | null {
     return this.parent;
+  }
+
+  /**
+   * Decrement the active-scope counter when a scope disposes.
+   * @internal called by DefaultScopedContainer.disposeScope(). The scope
+   * previously tried to decrement via getStatistics(), which returns a copy, so
+   * the counter never went down — activeScopes leaked one per created scope
+   * (i.e. one per HTTP request under the Fastify integration).
+   */
+  _notifyScopeDisposed(): void {
+    this.statistics.activeScopes = Math.max(0, this.statistics.activeScopes - 1);
   }
 
   /**
@@ -495,7 +597,9 @@ export class DefaultServiceContainer implements ServiceContainer {
 
     // Clear all data
     this.registrations.clear();
+    this.tagIndex.clear();
     this.singletonInstances.clear();
+    this.pendingSingletons.clear();
     this.eventListeners.clear();
     this.children.length = 0;
 
@@ -597,52 +701,60 @@ export class DefaultServiceContainer implements ServiceContainer {
       }
     }
 
-    // Detect cycles (simplified cycle detection)
-    // Why: Help identify circular dependencies for debugging
-    for (const node of nodes.values()) {
-      const visited = new Set<string>();
-      const path: string[] = [];
-
-      if (this.detectCycle(node.name, nodes, visited, path)) {
-        cycles.push([...path]);
-      }
-    }
+    // Detect cycles with a 3-color DFS. Each distinct cycle is reported exactly
+    // once (canonicalized), with no spurious prefix nodes — unlike the previous
+    // shared-visited walk which duplicated cycles and prepended unrelated path
+    // segments.
+    this.collectCycles(nodes, cycles);
 
     return { nodes, roots, leaves, cycles };
   }
 
   /**
-   * Detect circular dependencies in dependency graph
-   * Recursive cycle detection algorithm
+   * Collect every distinct dependency cycle via 3-color DFS.
+   * GREY = on the current DFS stack, BLACK = fully explored. A back-edge to a
+   * GREY node is a cycle; we slice it off the stack and canonicalize so the same
+   * cycle reached from different roots is reported once.
    */
-  private detectCycle(
-    nodeName: string,
-    nodes: Map<string, DependencyNode>,
-    visited: Set<string>,
-    path: string[]
-  ): boolean {
-    if (path.includes(nodeName)) {
-      return true; // Cycle detected
-    }
+  private collectCycles(nodes: Map<string, DependencyNode>, cycles: string[][]): void {
+    const GREY = 1;
+    const BLACK = 2;
+    const color = new Map<string, number>();
+    const stack: string[] = [];
+    const seen = new Set<string>();
 
-    if (visited.has(nodeName)) {
-      return false; // Already processed
-    }
+    const visit = (name: string): void => {
+      color.set(name, GREY);
+      stack.push(name);
 
-    visited.add(nodeName);
-    path.push(nodeName);
-
-    const node = nodes.get(nodeName);
-    if (node) {
-      for (const depName of node.dependencies) {
-        if (this.detectCycle(depName, nodes, visited, path)) {
-          return true;
+      const node = nodes.get(name);
+      if (node) {
+        for (const dep of node.dependencies) {
+          if (!nodes.has(dep)) continue; // external/unregistered dependency
+          const c = color.get(dep);
+          if (c === GREY) {
+            const idx = stack.indexOf(dep);
+            const cycle = stack.slice(idx);
+            const key = canonicalCycleKey(cycle);
+            if (!seen.has(key)) {
+              seen.add(key);
+              cycles.push(cycle);
+            }
+          } else if (c !== BLACK) {
+            visit(dep);
+          }
         }
       }
-    }
 
-    path.pop();
-    return false;
+      stack.pop();
+      color.set(name, BLACK);
+    };
+
+    for (const name of nodes.keys()) {
+      if (color.get(name) === undefined) {
+        visit(name);
+      }
+    }
   }
 
   /**
@@ -668,22 +780,23 @@ export class DefaultScopedContainer implements ScopedContainer {
   private disposed = false;
   private disposeTimer?: NodeJS.Timeout;
 
-  constructor(parent: ServiceContainer, context: ServiceContext) {
+  constructor(parent: ServiceContainer, context: ServiceContext, scopeTimeout = 30000) {
     this.parent = parent;
     this.context = context;
 
-    // Set up automatic disposal timer
-    // Why: Prevent memory leaks from abandoned scopes
-    // Skip timeout in test environment to prevent Jest open handles
+    // Set up automatic disposal timer honoring the configured scopeTimeout
+    // (previously hardcoded 30s and gated on an unrelated activeScopes check, so
+    // configuration.scopeTimeout was silently ignored). Skipped in test env to
+    // avoid Jest open handles; unref()'d so an idle scope timer never keeps the
+    // process alive on its own.
     const isTestEnv = process.env.NODE_ENV === "test" || process.env.JEST_WORKER_ID !== undefined;
-    const timeout =
-      !isTestEnv && (parent as DefaultServiceContainer).getStatistics().activeScopes > 0
-        ? 30000
-        : 0;
-    if (timeout > 0) {
+    if (!isTestEnv && scopeTimeout > 0) {
       this.disposeTimer = setTimeout(() => {
         this.disposeScope().catch(console.error);
-      }, timeout);
+      }, scopeTimeout);
+      if (typeof this.disposeTimer.unref === "function") {
+        this.disposeTimer.unref();
+      }
     }
   }
 
@@ -709,24 +822,34 @@ export class DefaultScopedContainer implements ScopedContainer {
       throw new Error("Cannot resolve services from disposed scope");
     }
 
-    const registration = this.parent.getRegistration(name);
-    if (!registration) {
-      return this.parent.resolve<T>(name, context || this.context);
-    }
-
-    // Handle scoped services
-    if (registration.lifetime === ServiceLifetime.SCOPED) {
-      if (this.scopedInstances.has(name)) {
-        return this.scopedInstances.get(name) as T;
+    return withResolutionContext(async () => {
+      const registration = this.parent.getRegistration(name);
+      if (!registration) {
+        return this.parent.resolve<T>(name, context || this.context);
       }
 
-      const instance = await registration.factory(this, context || this.context);
-      this.scopedInstances.set(name, instance);
-      return instance as T;
-    }
+      // Handle scoped services with the same cycle guard and finalization
+      // (Promise-field resolution + initialize()) as the root container, instead
+      // of a bare factory() call that skipped both.
+      if (registration.lifetime === ServiceLifetime.SCOPED) {
+        if (this.scopedInstances.has(name)) {
+          return this.scopedInstances.get(name) as T;
+        }
 
-    // Delegate to parent for non-scoped services
-    return this.parent.resolve<T>(name, context || this.context);
+        const instance = await createScopedInstance<T>(
+          this,
+          registration,
+          context || this.context,
+          name
+        );
+        this.scopedInstances.set(name, instance);
+        return instance;
+      }
+
+      // Delegate to parent for non-scoped services (shares the active resolution
+      // context so cross-scope cycles are detected too).
+      return this.parent.resolve<T>(name, context || this.context);
+    });
   }
 
   async resolveAll<T>(tag: string, context?: ServiceContext): Promise<T[]> {
@@ -808,8 +931,12 @@ export class DefaultScopedContainer implements ScopedContainer {
 
     this.scopedInstances.clear();
 
-    // Update parent statistics
-    const parentStats = (this.parent as DefaultServiceContainer).getStatistics();
-    parentStats.activeScopes = Math.max(0, parentStats.activeScopes - 1);
+    // Decrement the parent's active-scope counter via its own method. The
+    // previous code mutated the copy returned by getStatistics(), so this never
+    // took effect and activeScopes leaked upward on every scope disposal.
+    const parent = this.parent as DefaultServiceContainer;
+    if (typeof parent._notifyScopeDisposed === "function") {
+      parent._notifyScopeDisposed();
+    }
   }
 }
