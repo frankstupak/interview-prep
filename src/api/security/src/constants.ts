@@ -94,6 +94,8 @@ export const AuthErrorMessage = {
   BEARER_TOKEN_AUTH_FAILED: "Bearer token authentication failed",
   INVALID_TOKEN: "Invalid token",
   TOKEN_EXPIRED: "Token expired",
+  TOKEN_REVOKED: "Token revoked",
+  PASSWORD_TOO_LONG: "Password must not exceed 72 bytes (bcrypt limit)",
   JWT_AUTH_FAILED: "JWT authentication failed",
   INVALID_CREDENTIALS: "Invalid credentials",
   CREDENTIAL_VALIDATION_FAILED: "Credential validation failed",

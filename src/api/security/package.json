@@ -12,6 +12,7 @@
     "test:coverage": "jest --coverage --testTimeout=90000",
     "test:auth": "jest src/auth-methods.test.ts",
     "test:roles": "jest src/roles.test.ts",
+    "bench": "tsx scripts/benchmark.ts",
     "lint": "eslint 'src/**/*.ts'",
     "lint:fix": "eslint 'src/**/*.ts' --fix && npm run format",
     "format": "prettier --write 'src/**/*.{ts,js,json}' '*.md'",
@@ -34,6 +35,7 @@
   "author": "Jonathan (https://github.com/SkinnnyJay)",
   "license": "MIT",
   "dependencies": {
+    "@fastify/swagger": "^9.4.0",
     "@fastify/websocket": "^11.2.0",
     "bcrypt": "^6.0.0",
     "fastify": "^5.7.4",

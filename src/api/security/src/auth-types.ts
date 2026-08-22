@@ -36,6 +36,8 @@ export interface JWTPayload {
   userId: string;
   username: string;
   roles: Role[];
+  /** Unique token id — enables server-side revocation on logout */
+  jti?: string;
   iat: number;
   exp: number;
 }
@@ -64,6 +66,10 @@ export interface AuthConfig {
   bearerTokenExpiresIn: number; // milliseconds
   refreshTokenExpiresIn: number; // milliseconds
   apiKeyPrefix: string;
+  /** Optional iss claim: signed into and verified on every JWT when set */
+  jwtIssuer?: string;
+  /** Optional aud claim: signed into and verified on every JWT when set */
+  jwtAudience?: string;
 }
 
 export interface AuthRequest {
